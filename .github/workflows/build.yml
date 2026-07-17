@@ -608,21 +608,21 @@ jobs:
         uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e # v4
         with:
           subject-path: |
-            plezy-windows-x64-portable.7z
-            plezy-windows-arm64-portable.7z
+            plezy-windows-x64-portable.zip
+            plezy-windows-arm64-portable.zip
             plezy-windows-installer.exe
 
       - name: Upload x64 portable
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-x64-portable
-          path: plezy-windows-x64-portable.7z
+          path: plezy-windows-x64-portable.zip
 
       - name: Upload arm64 portable
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-arm64-portable
-          path: plezy-windows-arm64-portable.7z
+          path: plezy-windows-arm64-portable.zip
 
       - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -849,8 +849,8 @@ jobs:
           prerelease: false
           files: |
             artifacts/windows-installer/plezy-windows-installer.exe
-            artifacts/windows-x64-portable/plezy-windows-x64-portable.7z
-            artifacts/windows-arm64-portable/plezy-windows-arm64-portable.7z
+            artifacts/windows-x64-portable/plezy-windows-x64-portable.zip
+            artifacts/windows-arm64-portable/plezy-windows-arm64-portable.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -1026,8 +1026,8 @@ jobs:
               echo artifacts/macos-dmg/plezy-macos.dmg
             fi
             if [ "${{ inputs.build_windows }}" = "true" ]; then
-              echo artifacts/windows-x64-portable/plezy-windows-x64-portable.7z
-              echo artifacts/windows-arm64-portable/plezy-windows-arm64-portable.7z
+              echo artifacts/windows-x64-portable/plezy-windows-x64-portable.zip
+              echo artifacts/windows-arm64-portable/plezy-windows-arm64-portable.zip
               echo artifacts/windows-installer/plezy-windows-installer.exe
             fi
             if [ "${{ inputs.build_linux }}" = "true" ]; then
