@@ -493,13 +493,22 @@ jobs:
         # `channel: master` would git-clone master HEAD (whose engine != our
         # patched 3.44.0). Clone the 3.44.0 tag directly to get engine rev
         # 4c525dac, which install-patched-engine.ps1 asserts before swapping.
+        #
+        # Fork fix: also fetch the 3.44.0 tag. Flutter derives its version from
+        # `git describe --tags`; fetching only the bare commit leaves the clone
+        # tagless, so `flutter --version` reports 0.0.0-unknown and `pub get`
+        # then fails pubspec's `flutter: ">=3.44.0"` with "version solving
+        # failed". The checkout still targets the pinned commit, so the tag only
+        # names the version and a re-pointed tag cannot swap the engine rev that
+        # install-patched-engine.ps1 asserts.
         shell: pwsh
         run: |
           $root = "$env:RUNNER_TEMP\flutter"
           git init $root
           git -C $root remote add origin https://github.com/flutter/flutter.git
           git -C $root fetch --depth 1 origin 559ffa3f75e7402d65a8def9c28389a9b2e6fe42
-          git -C $root checkout --detach FETCH_HEAD
+          git -C $root fetch --depth 1 origin tag 3.44.0
+          git -C $root checkout --detach 559ffa3f75e7402d65a8def9c28389a9b2e6fe42
           "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           & "$root\bin\flutter.bat" --version
 
