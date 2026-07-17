@@ -60,14 +60,20 @@ if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
     }
 }
 
-# Create Portable Archives
+# Create Portable Archives.
+#
+# zip, not 7z: Windows Explorer opens zip natively, whereas a .7z is a dead end
+# without 7-Zip installed. The build is 70+ files (exe, the Flutter/mpv/sqlite
+# DLLs, and data/), so it needs an archive either way -- but the archive should
+# not be the thing that stops someone running it. -tzip keeps 7-Zip's -mx=9
+# compression and just writes the zip container.
 if ($HasX64) {
     Write-Host "`nCreating x64 portable archive..." -ForegroundColor Cyan
-    $X64Portable = Join-Path $ResolvedOutput "plezy-windows-x64-portable.7z"
+    $X64Portable = Join-Path $ResolvedOutput "plezy-windows-x64-portable.zip"
     Push-Location $X64BuildDir
     try {
         if (Test-Path $X64Portable) { Remove-Item $X64Portable -Force }
-        7z a -mx=9 $X64Portable *
+        7z a -tzip -mx=9 $X64Portable *
         Write-Host "Created: $X64Portable" -ForegroundColor Green
     } finally {
         Pop-Location
@@ -76,11 +82,11 @@ if ($HasX64) {
 
 if ($HasArm64) {
     Write-Host "`nCreating arm64 portable archive..." -ForegroundColor Cyan
-    $Arm64Portable = Join-Path $ResolvedOutput "plezy-windows-arm64-portable.7z"
+    $Arm64Portable = Join-Path $ResolvedOutput "plezy-windows-arm64-portable.zip"
     Push-Location $Arm64BuildDir
     try {
         if (Test-Path $Arm64Portable) { Remove-Item $Arm64Portable -Force }
-        7z a -mx=9 $Arm64Portable *
+        7z a -tzip -mx=9 $Arm64Portable *
         Write-Host "Created: $Arm64Portable" -ForegroundColor Green
     } finally {
         Pop-Location
