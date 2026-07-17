@@ -19,10 +19,12 @@ A modern client for Plex and Jellyfin on desktop, mobile, and TV. Built with Flu
 
 ## Download
 
-| Platform | Download |
+Grab the newest build from the [**Releases**](https://github.com/TeeJS/plezy/releases) page.
+
+| Platform | Builds |
 | --- | --- |
-| Windows | [Installer (x64, arm64)](https://github.com/TeeJS/plezy/releases/download/windows-latest/plezy-windows-installer.exe) · [Portable x64](https://github.com/TeeJS/plezy/releases/download/windows-latest/plezy-windows-x64-portable.7z) · [Portable arm64](https://github.com/TeeJS/plezy/releases/download/windows-latest/plezy-windows-arm64-portable.7z) |
-| Android | [APK arm64-v8a](https://github.com/TeeJS/plezy/releases/download/android-latest/plezy-android-arm64-v8a.apk) · [armeabi-v7a](https://github.com/TeeJS/plezy/releases/download/android-latest/plezy-android-armeabi-v7a.apk) · [x86_64](https://github.com/TeeJS/plezy/releases/download/android-latest/plezy-android-x86_64.apk) |
+| Windows | Installer (x64 + arm64) · Portable x64 · Portable arm64 |
+| Android | APK — arm64-v8a · armeabi-v7a · x86_64 |
 
 ## Features
 
