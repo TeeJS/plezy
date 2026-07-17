@@ -23,6 +23,14 @@ on:
         description: Build Linux
         default: true
         type: boolean
+      # Fork-only: the fork publishes rolling android-latest / windows-latest
+      # releases straight from a main build. Turn this off to produce artifacts
+      # without publishing them — e.g. to Authenticode-sign the Windows binaries
+      # locally first, so unsigned ones never reach the release.
+      publish_rolling:
+        description: "Publish rolling releases (fork only; off = build artifacts only)"
+        default: true
+        type: boolean
 
 env:
   SENTRY_DART_DEFINE: ${{ github.repository == 'edde746/plezy' && '--dart-define=ENABLE_SENTRY=true' || '' }}
@@ -148,16 +156,17 @@ jobs:
 
       # Fork-only: publish the raw APKs to a rolling "android-latest" release so
       # the README download links always serve the newest build. Runs only on
-      # this fork's main branch so feature-branch builds don't clobber the files.
+      # this fork's main branch so feature-branch builds don't clobber the files,
+      # and only when publish_rolling is on (see the input's comment).
       - name: Stage raw APKs for release
-        if: github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main'
+        if: ${{ inputs.publish_rolling && github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main' }}
         run: |
           cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk plezy-android-arm64-v8a.apk
           cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk plezy-android-armeabi-v7a.apk
           cp build/app/outputs/flutter-apk/app-x86_64-release.apk plezy-android-x86_64.apk
 
       - name: Publish APKs to android-latest release
-        if: github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main'
+        if: ${{ inputs.publish_rolling && github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main' }}
         uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
           tag_name: android-latest
@@ -794,11 +803,13 @@ jobs:
 
   # Fork-only: publish the Windows binaries to a rolling "windows-latest"
   # release so the README download links always serve the newest build. Runs
-  # only on this fork's main branch so feature-branch builds don't clobber it.
+  # only on this fork's main branch so feature-branch builds don't clobber it,
+  # and only when publish_rolling is on. Turn that input off to build artifacts
+  # for local Authenticode signing, then upload the signed binaries by hand.
   publish-windows-latest:
     needs: [package-windows]
     runs-on: ubuntu-latest
-    if: github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main'
+    if: ${{ inputs.publish_rolling && github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main' }}
     permissions:
       contents: write
     steps:
