@@ -73,3 +73,7 @@ maestro/**/*.png
 server/deploy.sh
 server/Caddyfile
 build-output/
+
+# Azure Trusted Signing dlib + metadata for local Authenticode signing.
+# Third-party binaries; re-fetch per machine rather than committing them.
+.signing/
