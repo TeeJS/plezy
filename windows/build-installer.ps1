@@ -251,11 +251,19 @@ end;
 $IssContent | Out-File -FilePath $SetupScript -Encoding ASCII
 Write-Host "Created: $SetupScript" -ForegroundColor Green
 
-# Check for Inno Setup
+# Check for Inno Setup. Look in the per-user location too: `winget install
+# JRSoftware.InnoSetup --scope user` lands there and needs no admin, whereas the
+# Chocolatey fallback below does. Without this, a non-admin machine can't build
+# the installer even with Inno Setup already installed.
 Write-Host "`nChecking for Inno Setup..." -ForegroundColor Cyan
-$InnoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+$InnoSetupCandidates = @(
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    "C:\Program Files\Inno Setup 6\ISCC.exe",
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+)
+$InnoSetupPath = $InnoSetupCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-if (-not (Test-Path $InnoSetupPath)) {
+if (-not $InnoSetupPath) {
     Write-Host "Inno Setup not found. Installing via Chocolatey..." -ForegroundColor Yellow
 
     if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
@@ -265,11 +273,13 @@ if (-not (Test-Path $InnoSetupPath)) {
 
     choco install innosetup -y
 
-    if (-not (Test-Path $InnoSetupPath)) {
+    $InnoSetupPath = $InnoSetupCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $InnoSetupPath) {
         Write-Error "Failed to install Inno Setup"
         exit 1
     }
 }
+Write-Host "  Using: $InnoSetupPath" -ForegroundColor DarkGray
 
 # Build Installer
 Write-Host "`nBuilding installer with Inno Setup..." -ForegroundColor Cyan
