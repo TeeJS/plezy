@@ -1,28 +1,11 @@
 part of '../../plex_client.dart';
 
-mixin _PlexPlayQueueMethods on MediaServerCacheMixin {
-  FailoverHttpClient get _http;
-
-  Future<MediaServerResponse> _getWithFailover(
-    String path, {
-    Map<String, dynamic>? queryParameters,
-    // ignore: unused_element_parameter
-    Map<String, String>? headers,
-    // ignore: unused_element_parameter
-    Duration? timeout,
-    // ignore: unused_element_parameter
-    AbortController? abort,
-    // ignore: unused_element_parameter
-    bool allowEndpointFailover = true,
-  });
-
+mixin _PlexPlayQueueMethods on _PlexClientInternals {
   PlexMetadataDto _createTaggedMetadataWithLibrary(
     Map<String, dynamic> json, {
     int? librarySectionID,
     String? librarySectionTitle,
   });
-
-  Future<String> buildMetadataUri(String ratingKey);
 
   PlayQueueResponse _parsePlayQueueResponse(dynamic data, {int? librarySectionID, String? librarySectionTitle}) {
     final container = data is Map && data['MediaContainer'] is Map
@@ -53,12 +36,8 @@ mixin _PlexPlayQueueMethods on MediaServerCacheMixin {
     return PlayQueueResponse(
       playQueueID: playQueueID,
       playQueueSelectedItemID: flexibleInt(container['playQueueSelectedItemID']),
-      playQueueSelectedItemOffset: flexibleInt(container['playQueueSelectedItemOffset']),
-      playQueueSelectedMetadataItemID: container['playQueueSelectedMetadataItemID'] as String?,
       playQueueShuffled: flexibleBool(container['playQueueShuffled']),
-      playQueueSourceURI: container['playQueueSourceURI'] as String?,
       playQueueTotalCount: flexibleInt(container['playQueueTotalCount']),
-      playQueueVersion: playQueueVersion,
       size: flexibleInt(container['size']),
       items: items,
     );
@@ -135,8 +114,12 @@ mixin _PlexPlayQueueMethods on MediaServerCacheMixin {
   }) async {
     try {
       // `/allLeaves` preserves Plex's aired episode order and interleaves
-      // specials; `/children` groups specials into a separate season.
-      final uri = '${await buildMetadataUri(showRatingKey)}/allLeaves';
+      // specials (#1416) — both what the server itself does (respectServer)
+      // and the explicit airDate mode. `/children` flattens season-by-season,
+      // keeping the Specials folder out of the regular run (#1952). Mirrors
+      // the client-side choice in [sortEpisodesByWatchOrder].
+      final leaf = effectiveSpecialsOrdering() == SpecialsOrdering.specialsLast ? 'children' : 'allLeaves';
+      final uri = '${await buildMetadataUri(showRatingKey)}/$leaf';
       return createPlayQueue(
         uri: uri,
         type: 'video',

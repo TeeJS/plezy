@@ -19,6 +19,7 @@ import com.edde746.plezy.shared.AudioFocusManager
 import com.edde746.plezy.shared.FrameRateManager
 import com.edde746.plezy.shared.PlayerDelegate
 import com.edde746.plezy.shared.PlayerSurfaceHost
+import com.edde746.plezy.shared.SurfacePlayerCore
 import dev.jdtech.mpv.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -35,13 +36,52 @@ import kotlinx.coroutines.sync.withLock
  *   configured before init to never open a video output (`vid=no`,
  *   `force-window=no`, `audio-display=no`, plus `gapless-audio=weak`).
  */
-class MpvPlayerCore(
+class MpvPlayerCore private constructor(
   private val context: Context,
-  private val audioOnly: Boolean = false
-) : SurfaceHolder.Callback {
+  private val audioOnly: Boolean,
+  private val hardwareDecoding: Boolean,
+  private val propertyWriterOverride: (suspend (String, String) -> Unit)?,
+  initializedForTesting: Boolean
+) : SurfaceHolder.Callback,
+  SurfacePlayerCore {
+  constructor(
+    context: Context,
+    audioOnly: Boolean = false,
+    hardwareDecoding: Boolean = true
+  ) : this(context, audioOnly, hardwareDecoding, null, false)
+
+  internal constructor(
+    context: Context,
+    audioOnly: Boolean,
+    propertyWriter: (suspend (String, String) -> Unit)?
+  ) : this(context, audioOnly, true, propertyWriter, true)
 
   companion object {
     private const val TAG = "MpvPlayerCore"
+
+    /**
+     * The initial `vo` chain, decided by whether this session will hardware-
+     * decode.
+     *
+     * gpu-next (libplacebo) is the only Android path that applies Dolby Vision
+     * RPU reshaping (#1902), but reshaping only ever happens under software
+     * decode: FFmpeg's mediacodec wrapper exports no DOVI side data, so a
+     * hardware-decoded stream renders the untouched base layer on any VO.
+     * Hardware decode is also where gpu-next breaks: it samples the decoder
+     * output as a samplerExternalOES that libplacebo declares in both shader
+     * stages, and the Tegra GLES linker rejects that pair ("struct type
+     * mismatch between shaders for uniform"), failing every frame — a solid
+     * blue screen with audio on the Shield (#2010). The in-chain gpu fallback
+     * cannot catch it because gpu-next initializes fine and only fails
+     * per-frame renders.
+     *
+     * So gpu-next is offered exactly where it can help — sessions that will
+     * software-decode — and hardware sessions keep the legacy gpu VO. A
+     * mid-session hwdec fallback to software stays on vo=gpu, which renders
+     * software frames correctly (the pre-2.15.0 behavior for every session).
+     */
+    internal fun initialVideoOutput(hardwareDecoding: Boolean): String =
+      if (hardwareDecoding) "gpu" else "gpu-next,gpu"
   }
 
   /** Video-only paths. The plugin always constructs video cores with the
@@ -71,6 +111,10 @@ class MpvPlayerCore(
   var isInitialized: Boolean = false
     private set
 
+  init {
+    if (initializedForTesting) isInitialized = true
+  }
+
   @Volatile private var player: MpvPlayer? = null
   private var scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
   private val endFileDiagnostics = MpvEndFileDiagnostics()
@@ -81,7 +125,6 @@ class MpvPlayerCore(
   // output (#1482).
   private val mpvWriteDispatcher = Dispatchers.IO.limitedParallelism(1)
 
-  // Frame rate matching
   private var frameRateManager: FrameRateManager? = null
   private val handler = Handler(Looper.getMainLooper())
 
@@ -95,12 +138,15 @@ class MpvPlayerCore(
     if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
   }
 
-  // Audio focus
   private var audioFocusManager: AudioFocusManager? = null
 
   @Volatile private var cachedPaused: Boolean = true
 
+  @Volatile private var desiredPaused: Boolean = true
+
   @Volatile private var pausedForSurfaceLoss: Boolean = false
+
+  @Volatile private var pausedForAudioFocusLoss: Boolean = false
 
   @Volatile private var hasAttachedSurface: Boolean = false
 
@@ -111,6 +157,16 @@ class MpvPlayerCore(
   @Volatile private var deferredResumeRequested: Boolean = false
 
   @Volatile private var resumeBlockedByPublicPause: Boolean = false
+
+  private data class PublicPauseIntent(
+    val generation: Long,
+    val previousBlocked: Boolean,
+    val previousDesiredPaused: Boolean
+  )
+
+  private val publicPauseIntentLock = Any()
+  private var publicPauseIntentGeneration = 0L
+  private val publicPauseWriteMutex = Mutex()
 
   @Volatile private var videoOutputEpoch: Long = 0L
   private val videoOutputMutex = Mutex()
@@ -186,14 +242,19 @@ class MpvPlayerCore(
       disposing = false
       endFileDiagnostics.onStartFile()
       cachedPaused = true
+      desiredPaused = true
       pausedForSurfaceLoss = false
+      pausedForAudioFocusLoss = false
       pendingSurface = null
       attachedSurface = null
       attachedToPlaceholder = false
       hasAttachedSurface = false
       videoOutputRestoring = false
       deferredResumeRequested = false
-      resumeBlockedByPublicPause = false
+      synchronized(publicPauseIntentLock) {
+        publicPauseIntentGeneration += 1L
+        resumeBlockedByPublicPause = false
+      }
       videoOutputEpoch = 0L
       pendingVideoOutputDisableJob?.cancel()
       pendingVideoOutputDisableJob = null
@@ -210,18 +271,12 @@ class MpvPlayerCore(
         handler = handler,
         contentType = if (audioOnly) AudioAttributes.CONTENT_TYPE_MUSIC else AudioAttributes.CONTENT_TYPE_MOVIE,
         onPause = {
-          scope.launch {
-            try {
-              player?.setProperty("pause", true)
-            } catch (e: Exception) {
-              Log.w(TAG, "Failed to pause on focus loss", e)
-            }
-          }
+          pauseForAudioFocusLoss()
         },
         onResume = {
-          requestAutoResume("audio focus gain")
+          resumeAfterAudioFocusGain("audio focus gain")
         },
-        isPaused = { cachedPaused }
+        isPaused = { desiredPaused }
       )
       if (!audioOnly) {
         frameRateManager = FrameRateManager(
@@ -247,7 +302,6 @@ class MpvPlayerCore(
         Log.d(TAG, "SurfaceView added to content view")
       }
 
-      // Create MpvPlayer on background thread via coroutine
       scope.launch {
         try {
           if (disposing) {
@@ -268,10 +322,12 @@ class MpvPlayerCore(
               setOption("audio-display", "no")
               setOption("gapless-audio", "weak")
             } else {
-              setOption("vo", "gpu")
+              // vo choice is decode-path-dependent; rationale on
+              // initialVideoOutput. Film grain is left on its `auto` default:
+              // applied by the VO under gpu-next, by the decoder under gpu.
+              setOption("vo", initialVideoOutput(hardwareDecoding))
               setOption("gpu-context", "android")
               setOption("opengl-es", "yes")
-              setOption("vd-lavc-film-grain", "cpu")
               if (displayFpsOverride != null) {
                 setOption("display-fps-override", displayFpsOverride)
               }
@@ -280,6 +336,12 @@ class MpvPlayerCore(
             // Pause on the last frame at EOF instead of unloading the file, so a
             // seek after the video ends still works (matches Linux/Windows).
             setOption("keep-open", "yes")
+            // Plezy only ever opens media-server streams and local files, so
+            // mpv's bundled ytdl_hook has nothing to resolve: it costs an
+            // on_load hook per open and, on a failed open, spawns yt-dlp with
+            // the access token in its argv. mpv decides whether to load the
+            // builtin script during mpv_initialize, hence an option here.
+            setOption("ytdl", "no")
           }
           if (displayFpsOverride != null) {
             Log.d(TAG, "Initial display-fps-override=$displayFpsOverride")
@@ -334,7 +396,10 @@ class MpvPlayerCore(
           is MpvEvent.EndFile -> {
             delegate?.onEvent("end-file", endFileDiagnostics.onEndFile(event))
           }
-          is MpvEvent.StartFile -> endFileDiagnostics.onStartFile()
+          is MpvEvent.StartFile -> {
+            endFileDiagnostics.onStartFile()
+            delegate?.onEvent("start-file", null)
+          }
           is MpvEvent.FileLoaded -> delegate?.onEvent("file-loaded", null)
           is MpvEvent.PlaybackRestart -> delegate?.onEvent("playback-restart", null)
           else -> {}
@@ -376,9 +441,15 @@ class MpvPlayerCore(
 
   // Audio Focus
 
-  fun requestAudioFocus(): Boolean = audioFocusManager?.requestAudioFocus() ?: false
+  override fun requestAudioFocus(): Boolean {
+    val granted = audioFocusManager?.requestAudioFocus() ?: false
+    if (granted && pausedForAudioFocusLoss) {
+      resumeAfterAudioFocusGain("audio focus request granted")
+    }
+    return granted
+  }
 
-  fun abandonAudioFocus() {
+  override fun abandonAudioFocus() {
     audioFocusManager?.abandonAudioFocus()
   }
 
@@ -571,23 +642,25 @@ class MpvPlayerCore(
             Log.d(TAG, "Skipping stale MPV placeholder attach ($reason, epoch=$epoch)")
             return@withLock
           }
-          val wasPaused = try {
-            p.getFlag("pause") == true
-          } catch (e: Exception) {
-            cachedPaused
-          }
-          if (!wasPaused) {
-            try {
-              p.setProperty("pause", true)
-              cachedPaused = true
-              pausedForSurfaceLoss = true
-              Log.d(TAG, "Paused MPV for surface loss ($reason, epoch=$epoch)")
+          publicPauseWriteMutex.withLock {
+            val wasPaused = try {
+              p.getFlag("pause") == true
             } catch (e: Exception) {
-              pausedForSurfaceLoss = false
-              Log.w(TAG, "Failed to pause MPV before placeholder attach ($reason)", e)
+              cachedPaused
             }
-          } else {
-            pausedForSurfaceLoss = false
+            if (!wasPaused) {
+              try {
+                p.setProperty("pause", true)
+                cachedPaused = true
+                pausedForSurfaceLoss = true
+                Log.d(TAG, "Paused MPV for surface loss ($reason, epoch=$epoch)")
+              } catch (e: Exception) {
+                pausedForSurfaceLoss = false
+                Log.w(TAG, "Failed to pause MPV before placeholder attach ($reason)", e)
+              }
+            } else {
+              pausedForSurfaceLoss = false
+            }
           }
           val surface = placeholderSurface?.takeIf { it.isValid } ?: run {
             Log.w(TAG, "No valid MPV placeholder surface available for $reason")
@@ -638,29 +711,106 @@ class MpvPlayerCore(
     else -> null
   }
 
+  private fun pauseForAudioFocusLoss() {
+    val shouldPause = synchronized(publicPauseIntentLock) {
+      (!desiredPaused).also { pausedForAudioFocusLoss = it }
+    }
+    if (!shouldPause) {
+      Log.d(TAG, "Skipping audio-focus pause because playback is already desirably paused")
+      return
+    }
+
+    scope.launch(mpvWriteDispatcher, start = CoroutineStart.ATOMIC) {
+      try {
+        publicPauseWriteMutex.withLock {
+          if (!pausedForAudioFocusLoss || disposing) return@withLock
+          writeProperty("pause", "yes")
+          cachedPaused = true
+        }
+      } catch (error: CancellationException) {
+        Log.d(TAG, "Canceled audio-focus pause")
+      } catch (error: Exception) {
+        Log.w(TAG, "Failed to pause on focus loss", error)
+      }
+    }
+  }
+
+  private fun resumeAfterAudioFocusGain(reason: String) {
+    val shouldResume = synchronized(publicPauseIntentLock) {
+      if (!pausedForAudioFocusLoss) {
+        false
+      } else {
+        pausedForAudioFocusLoss = false
+        true
+      }
+    }
+    if (shouldResume) requestAutoResume(reason)
+  }
+
+  private fun rollbackFailedPublicPauseIntent(intent: PublicPauseIntent) {
+    synchronized(publicPauseIntentLock) {
+      if (publicPauseIntentGeneration == intent.generation) {
+        resumeBlockedByPublicPause = intent.previousBlocked
+        desiredPaused = intent.previousDesiredPaused
+      }
+    }
+  }
+
+  private fun completePublicResumeNoOp(onComplete: ((Result<Unit>) -> Unit)?) {
+    runOnMain {
+      val completion: Result<Unit> = if (disposing || !isInitialized || !scope.isActive) {
+        Result.failure(CancellationException("MPV core unavailable"))
+      } else {
+        Result.success(Unit)
+      }
+      onComplete?.invoke(completion)
+    }
+  }
+
   private fun requestAutoResume(reason: String) {
-    val p = player ?: return
+    val p = player
+    if (p == null && propertyWriterOverride == null) return
     if (disposing) return
 
-    if (resumeBlockedByPublicPause) {
-      deferredResumeRequested = false
-      Log.d(TAG, "Skipping auto-resume after $reason because playback is explicitly paused")
-      return
+    val intentGeneration = synchronized(publicPauseIntentLock) {
+      if (resumeBlockedByPublicPause) {
+        deferredResumeRequested = false
+        Log.d(TAG, "Skipping auto-resume after $reason because playback is explicitly paused")
+        return
+      }
+
+      if (!hasReadyVideoOutput()) {
+        deferredResumeRequested = true
+        Log.d(TAG, "Deferring auto-resume after $reason until video output is ready")
+        return
+      }
+      publicPauseIntentGeneration
     }
 
-    if (!hasReadyVideoOutput()) {
-      deferredResumeRequested = true
-      Log.d(TAG, "Deferring auto-resume after $reason until video output is ready")
-      return
-    }
-
-    scope.launch {
+    scope.launch(mpvWriteDispatcher) {
       try {
-        if (p.getFlag("pause") == true) {
-          Log.d(TAG, "Auto-resuming playback after $reason")
-          p.setProperty("pause", false)
-        } else {
-          Log.d(TAG, "Skipping auto-resume after $reason because playback is already running")
+        publicPauseWriteMutex.withLock {
+          val shouldResume = synchronized(publicPauseIntentLock) {
+            !pausedForAudioFocusLoss &&
+              !resumeBlockedByPublicPause &&
+              publicPauseIntentGeneration == intentGeneration
+          }
+          if (!shouldResume) {
+            Log.d(TAG, "Skipping stale auto-resume after $reason")
+            return@withLock
+          }
+          val isPaused = p?.getFlag("pause") ?: cachedPaused
+          if (isPaused) {
+            Log.d(TAG, "Auto-resuming playback after $reason")
+            if (p != null) {
+              p.setProperty("pause", false)
+            } else {
+              writeProperty("pause", "no")
+            }
+            cachedPaused = false
+          } else {
+            Log.d(TAG, "Skipping auto-resume after $reason because playback is already running")
+          }
         }
       } catch (e: Exception) {
         Log.w(TAG, "Failed to resume after $reason", e)
@@ -669,62 +819,197 @@ class MpvPlayerCore(
   }
 
   private suspend fun applyDeferredResumeIfNeeded(p: MpvPlayer, reason: String) {
-    if (!deferredResumeRequested) return
-
-    if (resumeBlockedByPublicPause) {
-      deferredResumeRequested = false
-      Log.d(TAG, "Dropping deferred auto-resume after $reason because playback is explicitly paused")
-      return
+    publicPauseWriteMutex.withLock {
+      val shouldResume = synchronized(publicPauseIntentLock) {
+        if (!deferredResumeRequested) {
+          false
+        } else if (pausedForAudioFocusLoss) {
+          Log.d(TAG, "Keeping deferred auto-resume pending after $reason until audio focus returns")
+          false
+        } else if (resumeBlockedByPublicPause) {
+          deferredResumeRequested = false
+          Log.d(TAG, "Dropping deferred auto-resume after $reason because playback is explicitly paused")
+          false
+        } else {
+          deferredResumeRequested = false
+          true
+        }
+      }
+      if (!shouldResume) return@withLock
+      if (p.getFlag("pause") == true) {
+        Log.d(TAG, "Applying deferred auto-resume after $reason")
+        p.setProperty("pause", false)
+        cachedPaused = false
+      } else {
+        Log.d(TAG, "Skipping deferred auto-resume after $reason because playback is already running")
+      }
     }
+  }
 
-    deferredResumeRequested = false
-    if (p.getFlag("pause") == true) {
-      Log.d(TAG, "Applying deferred auto-resume after $reason")
-      p.setProperty("pause", false)
+  private suspend fun writeProperty(name: String, value: String) {
+    val writer = propertyWriterOverride
+    if (writer != null) {
+      writer(name, value)
     } else {
-      Log.d(TAG, "Skipping deferred auto-resume after $reason because playback is already running")
+      val currentPlayer = player ?: throw CancellationException("MPV player unavailable")
+      currentPlayer.setProperty(name, value)
     }
   }
 
   // Public API
+  /**
+   * Atomically records the public pause intent applied by the next loadfile
+   * operation. The load owns the native state transition, so this deliberately
+   * does not enqueue a second pause property write.
+   */
+  fun setPauseIntentForLoad(paused: Boolean) {
+    if (!isInitialized || disposing || !scope.isActive) return
 
-  fun setProperty(name: String, value: String, onComplete: ((Boolean) -> Unit)? = null) {
-    if (!isInitialized || disposing || !scope.isActive) {
-      onComplete?.invoke(false)
-      return
-    }
-    if (name == "pause") {
-      val paused = normalizePauseValue(value)
-      if (paused == true) {
+    synchronized(publicPauseIntentLock) {
+      publicPauseIntentGeneration += 1L
+      desiredPaused = paused
+      resumeBlockedByPublicPause = paused
+      if (paused) {
         cachedPaused = true
         pausedForSurfaceLoss = false
-        resumeBlockedByPublicPause = true
+        pausedForAudioFocusLoss = false
         deferredResumeRequested = false
-        Log.d(TAG, "Public pause state updated: paused=true")
-      } else if (paused == false) {
-        resumeBlockedByPublicPause = false
-        if (!hasReadyVideoOutput()) {
-          deferredResumeRequested = true
-          Log.d(TAG, "Deferring public resume until video output is ready")
-          onComplete?.invoke(true)
-          return
-        }
+      } else if (!pausedForSurfaceLoss && !pausedForAudioFocusLoss && !deferredResumeRequested) {
         cachedPaused = false
-        pausedForSurfaceLoss = false
-        Log.d(TAG, "Public pause state updated: paused=false")
       }
     }
-    scope.launch(mpvWriteDispatcher) {
-      var success = false
-      try {
-        player?.setProperty(name, value)
-        success = true
-      } catch (e: Exception) {
-        Log.w(TAG, "setProperty($name) failed", e)
-      } finally {
-        withContext(NonCancellable + Dispatchers.Main) {
-          onComplete?.invoke(success)
+    Log.d(TAG, "Load pause intent updated: paused=$paused")
+  }
+
+  fun setProperty(name: String, value: String, onComplete: ((Result<Unit>) -> Unit)? = null) {
+    if (!isInitialized || disposing || !scope.isActive) {
+      onComplete?.invoke(Result.failure(CancellationException("MPV core unavailable")))
+      return
+    }
+
+    val paused = if (name == "pause") normalizePauseValue(value) else null
+    val pauseIntent = paused?.let {
+      synchronized(publicPauseIntentLock) {
+        PublicPauseIntent(
+          generation = ++publicPauseIntentGeneration,
+          previousBlocked = resumeBlockedByPublicPause,
+          previousDesiredPaused = desiredPaused
+        ).also {
+          resumeBlockedByPublicPause = paused
+          desiredPaused = paused
         }
+      }
+    }
+
+    if (paused == false && pauseIntent != null) {
+      val shouldReclaimAudioFocus = synchronized(publicPauseIntentLock) {
+        publicPauseIntentGeneration == pauseIntent.generation && pausedForAudioFocusLoss
+      }
+      if (shouldReclaimAudioFocus) {
+        val focusGranted = audioFocusManager?.requestAudioFocus() == true
+        if (!focusGranted) {
+          Log.w(TAG, "Audio focus request denied; keeping public resume pending")
+          completePublicResumeNoOp(onComplete)
+          return
+        }
+
+        synchronized(publicPauseIntentLock) {
+          if (publicPauseIntentGeneration == pauseIntent.generation && pausedForAudioFocusLoss) {
+            pausedForAudioFocusLoss = false
+          }
+        }
+      }
+    }
+
+    if (paused == false && pauseIntent != null && !hasReadyVideoOutput()) {
+      runOnMain {
+        if (!isInitialized || disposing || !scope.isActive) {
+          onComplete?.invoke(Result.failure(CancellationException("MPV core unavailable")))
+          return@runOnMain
+        }
+        var deferredForSurface = false
+        val interruptedAgain = synchronized(publicPauseIntentLock) {
+          if (publicPauseIntentGeneration != pauseIntent.generation) {
+            false
+          } else if (pausedForAudioFocusLoss) {
+            true
+          } else {
+            deferredResumeRequested = true
+            deferredForSurface = true
+            false
+          }
+        }
+        if (interruptedAgain) {
+          Log.d(TAG, "Public resume deferred by a newer audio-focus loss")
+          onComplete?.invoke(Result.success(Unit))
+        } else {
+          if (deferredForSurface) {
+            Log.d(TAG, "Deferring public resume until video output is ready")
+          }
+          onComplete?.invoke(Result.success(Unit))
+        }
+      }
+      return
+    }
+
+    scope.launch(mpvWriteDispatcher, start = CoroutineStart.ATOMIC) {
+      var interruptedBeforeWrite = false
+      val writeResult = try {
+        if (pauseIntent == null) {
+          writeProperty(name, value)
+        } else {
+          publicPauseWriteMutex.withLock {
+            val shouldWrite = synchronized(publicPauseIntentLock) {
+              val isCurrent = publicPauseIntentGeneration == pauseIntent.generation
+              if (isCurrent && paused == false && pausedForAudioFocusLoss) {
+                interruptedBeforeWrite = true
+                false
+              } else {
+                isCurrent
+              }
+            }
+            if (shouldWrite) writeProperty(name, value)
+          }
+        }
+        if (interruptedBeforeWrite) {
+          Log.d(TAG, "Public resume write skipped after a newer audio-focus loss")
+        }
+        Result.success(Unit)
+      } catch (error: CancellationException) {
+        Result.failure(error)
+      } catch (error: Exception) {
+        Log.w(TAG, "MPV property write failed")
+        Result.failure(error)
+      }
+
+      if (writeResult.isFailure && pauseIntent != null) {
+        rollbackFailedPublicPauseIntent(pauseIntent)
+      }
+
+      withContext(NonCancellable + Dispatchers.Main) {
+        val completion = if (disposing || !isInitialized) {
+          Result.failure(CancellationException("MPV core unavailable"))
+        } else {
+          writeResult
+        }
+        val isCurrent = pauseIntent == null ||
+          synchronized(publicPauseIntentLock) {
+            publicPauseIntentGeneration == pauseIntent.generation
+          }
+        if (isCurrent && completion.isSuccess && !interruptedBeforeWrite) {
+          if (paused == true) {
+            cachedPaused = true
+            pausedForSurfaceLoss = false
+            deferredResumeRequested = false
+            Log.d(TAG, "Public pause state updated: paused=true")
+          } else if (paused == false) {
+            cachedPaused = false
+            pausedForSurfaceLoss = false
+            deferredResumeRequested = false
+            Log.d(TAG, "Public pause state updated: paused=false")
+          }
+        }
+        onComplete?.invoke(completion)
       }
     }
   }
@@ -784,6 +1069,7 @@ class MpvPlayerCore(
       "estimated-vf-fps" to getProperty("estimated-vf-fps"),
       "video-bitrate" to getProperty("video-bitrate"),
       "hwdec-current" to getProperty("hwdec-current"),
+      "current-vo" to getProperty("current-vo"),
       "audio-codec-name" to getProperty("audio-codec-name"),
       "audio-params/samplerate" to getProperty("audio-params/samplerate"),
       "audio-params/hr-channels" to getProperty("audio-params/hr-channels"),
@@ -847,7 +1133,7 @@ class MpvPlayerCore(
     }
   }
 
-  fun setVisible(visible: Boolean) {
+  override fun setVisible(visible: Boolean) {
     // Audio-only: no render layer to show or hide — tolerated no-op.
     if (audioOnly || disposing) return
     runOnMain {
@@ -872,11 +1158,11 @@ class MpvPlayerCore(
     }
   }
 
-  fun onPipModeChanged(isInPipMode: Boolean) {
+  override fun onPipModeChanged(isInPipMode: Boolean) {
     // MPV handles aspect ratio internally via its own surface management
   }
 
-  fun updateFrame() {
+  override fun updateFrame() {
     // Audio-only: no surface to refresh — tolerated no-op.
     if (audioOnly || disposing) return
     runOnMain {
@@ -911,7 +1197,7 @@ class MpvPlayerCore(
 
   // Frame Rate Matching
 
-  fun setVideoFrameRate(
+  override fun setVideoFrameRate(
     fps: Float,
     videoDurationMs: Long,
     extraDelayMs: Long,
@@ -933,7 +1219,7 @@ class MpvPlayerCore(
     }
   }
 
-  fun clearVideoFrameRate() {
+  override fun clearVideoFrameRate() {
     frameRateManager?.clearVideoFrameRate()
   }
 
@@ -1003,10 +1289,15 @@ class MpvPlayerCore(
     placeholderImageReader?.close()
     placeholderImageReader = null
     pausedForSurfaceLoss = false
+    pausedForAudioFocusLoss = false
     attachedToPlaceholder = false
     videoOutputRestoring = false
     deferredResumeRequested = false
-    resumeBlockedByPublicPause = false
+    synchronized(publicPauseIntentLock) {
+      publicPauseIntentGeneration += 1L
+      resumeBlockedByPublicPause = false
+      desiredPaused = true
+    }
     videoOutputEpoch = 0L
     pendingVideoOutputDisableJob = null
     isInitialized = false

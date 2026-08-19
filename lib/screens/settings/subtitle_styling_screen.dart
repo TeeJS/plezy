@@ -42,24 +42,25 @@ class SubtitleStylingScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Anchor-to-screen is an ExoPlayer text-subtitle knob; mpv already places
+    // plaintext subtitles in the letterbox margins by default.
+    final exoActive = Platform.isAndroid && SettingsService.instance.read(SettingsService.useExoPlayer);
     return SettingsPage(
       title: Text(t.screens.subtitleStyling),
       children: [
         SettingsGroup(
           title: t.subtitlingStyling.text,
           children: [
-            SettingSelectionTile<SubAssOverride, SubAssOverride>(
+            SettingSelectionTile<SubAssOverride>(
               pref: SettingsService.subAssOverride,
               icon: Symbols.subtitles_rounded,
               title: t.subtitlingStyling.assOverride,
               subtitleBuilder: _assOverrideLabel,
               options: SubAssOverride.values.map((v) => DialogOption(value: v, title: _assOverrideLabel(v))).toList(),
-              decode: (v) => v,
-              encode: (v) => v,
             ),
             // iOS/tvOS avfoundation VO: screen vs video-resolution basis.
             if (Platform.isIOS)
-              SettingSelectionTile<SubtitleRenderResolution, SubtitleRenderResolution>(
+              SettingSelectionTile<SubtitleRenderResolution>(
                 pref: SettingsService.subtitleRenderResolution,
                 icon: Symbols.aspect_ratio_rounded,
                 title: t.subtitlingStyling.renderResolution,
@@ -68,13 +69,11 @@ class SubtitleStylingScreen extends StatelessWidget {
                   SubtitleRenderResolution.screen,
                   SubtitleRenderResolution.video,
                 ].map((v) => DialogOption(value: v, title: _renderResolutionLabel(v))).toList(),
-                decode: (v) => v,
-                encode: (v) => v,
               ),
             // Android libass overlay: full or a fractional render scale (perf knob for
             // render-bound low-end TVs; heavy/animated signs raster faster at < 1).
             if (Platform.isAndroid)
-              SettingSelectionTile<SubtitleRenderResolution, SubtitleRenderResolution>(
+              SettingSelectionTile<SubtitleRenderResolution>(
                 pref: SettingsService.subtitleRenderResolution,
                 icon: Symbols.aspect_ratio_rounded,
                 title: t.subtitlingStyling.renderResolution,
@@ -86,8 +85,6 @@ class SubtitleStylingScreen extends StatelessWidget {
                   SubtitleRenderResolution.third,
                   SubtitleRenderResolution.quarter,
                 ].map((v) => DialogOption(value: v, title: _renderResolutionLabel(v))).toList(),
-                decode: (v) => v,
-                encode: (v) => v,
               ),
             SettingNumberTile(
               pref: SettingsService.subtitleFontSize,
@@ -114,6 +111,13 @@ class SubtitleStylingScreen extends StatelessWidget {
               min: 0,
               max: 100,
             ),
+            if (exoActive)
+              SettingSwitchTile(
+                pref: SettingsService.subtitleAnchorToScreen,
+                icon: Symbols.fit_screen_rounded,
+                title: t.subtitlingStyling.anchorToScreen,
+                subtitle: t.subtitlingStyling.anchorToScreenDescription,
+              ),
             SettingSwitchTile(
               pref: SettingsService.subtitleBold,
               icon: Symbols.format_bold_rounded,

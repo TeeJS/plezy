@@ -7,6 +7,7 @@ import 'package:plezy/media/media_backend.dart';
 import 'package:plezy/media/media_item.dart';
 import 'package:plezy/media/media_kind.dart';
 import 'package:plezy/mixins/paginated_item_loader.dart';
+import 'package:plezy/mixins/standard_paginated_view.dart';
 import 'package:plezy/utils/media_server_http_client.dart';
 import 'package:plezy/exceptions/media_server_exceptions.dart';
 import '../test_helpers/media_items.dart';
@@ -27,9 +28,19 @@ class _PaginatedProbe extends StatefulWidget {
   State<_PaginatedProbe> createState() => _PaginatedProbeState();
 }
 
-class _PaginatedProbeState extends State<_PaginatedProbe> with PaginatedItemLoader<MediaItem, _PaginatedProbe> {
+class _PaginatedProbeState extends State<_PaginatedProbe>
+    with PaginatedItemLoader<MediaItem, _PaginatedProbe>, StandardPaginatedView<MediaItem, _PaginatedProbe> {
   int fetchCalls = 0;
   final List<({int start, int size})> fetchArgs = [];
+
+  /// View fields required by [StandardPaginatedView], mirroring the
+  /// `items`/`isLoading`/`errorMessage` trio the real screens expose.
+  @override
+  List<MediaItem> items = [];
+  @override
+  bool isLoading = false;
+  @override
+  String? errorMessage;
 
   @override
   Future<LibraryPage<MediaItem>> fetchPage(int start, int size, AbortController? abort) {
@@ -109,10 +120,8 @@ void main() {
       expect(hooked, [(0, 5)]);
     });
 
-    testWidgets('loadInitialPaginatedItems applies reset, data, and success callback', (tester) async {
+    testWidgets('loadStandardPaginatedItems resets view state, publishes items, and fires onLoaded', (tester) async {
       late _PaginatedProbeState state;
-      var reset = false;
-      List<MediaItem>? applied;
       (int, int)? counts;
       await tester.pumpWidget(
         _PaginatedProbe(
@@ -121,25 +130,26 @@ void main() {
         ),
       );
 
-      final succeeded = await state.loadInitialPaginatedItems(
+      // Stale view state from a previous load must be cleared by the reset.
+      state.items = [_meta(99)];
+      state.errorMessage = 'stale error';
+
+      await state.loadStandardPaginatedItems(
         pageSize: 3,
-        resetViewState: () => reset = true,
-        applyLoadedItems: (items) => applied = items,
-        applyError: (error, stackTrace) => fail('unexpected error: $error'),
+        errorMessageFor: (error, stackTrace) => fail('unexpected error: $error'),
         onLoaded: (loaded, total) => counts = (loaded, total),
       );
       await tester.pump();
 
-      expect(succeeded, isTrue);
-      expect(reset, isTrue);
-      expect(applied?.map((item) => item.id), ['k0', 'k1', 'k2']);
+      expect(state.items.map((item) => item.id), ['k0', 'k1', 'k2']);
+      expect(state.isLoading, isFalse);
+      expect(state.errorMessage, isNull);
       expect(counts, (3, 7));
     });
 
-    testWidgets('loadInitialPaginatedItems applies one error transaction', (tester) async {
+    testWidgets('loadStandardPaginatedItems applies one error transaction', (tester) async {
       late _PaginatedProbeState state;
-      Object? appliedError;
-      Object? loggedError;
+      Object? reportedError;
       await tester.pumpWidget(
         _PaginatedProbe(
           onState: (s) => state = s,
@@ -147,18 +157,20 @@ void main() {
         ),
       );
 
-      final succeeded = await state.loadInitialPaginatedItems(
+      await state.loadStandardPaginatedItems(
         pageSize: 3,
-        resetViewState: () {},
-        applyLoadedItems: (_) => fail('items must not be applied'),
-        applyError: (error, stackTrace) => appliedError = error,
-        onError: (error, stackTrace) => loggedError = error,
+        errorMessageFor: (error, stackTrace) {
+          reportedError = error;
+          return 'could not load';
+        },
+        onLoaded: (_, _) => fail('items must not be applied'),
       );
       await tester.pump();
 
-      expect(succeeded, isFalse);
-      expect(appliedError, isA<StateError>());
-      expect(loggedError, same(appliedError));
+      expect(reportedError, isA<StateError>());
+      expect(state.errorMessage, 'could not load');
+      expect(state.isLoading, isFalse);
+      expect(state.items, isEmpty);
     });
 
     testWidgets('totalSize == 0 means no more pages — ensureRangeLoaded is a no-op', (tester) async {
@@ -166,12 +178,10 @@ void main() {
       await tester.pumpWidget(
         _PaginatedProbe(
           onState: (s) => state = s,
-          // Empty list mirrors the "library has no items" wire response.
           fetcher: (start, size, abort) async => const LibraryPage<MediaItem>(items: [], totalCount: 0),
         ),
       );
 
-      // Initial page reports totalSize = 0.
       await state.loadInitialPage(20);
       await tester.pump();
 
@@ -231,7 +241,6 @@ void main() {
       state.ensureIndexLoaded(350, pageSize: 200);
       await tester.pumpAndSettle();
 
-      // The probe records its calls; the second one should target start=200.
       expect(state.fetchArgs.length, greaterThanOrEqualTo(2));
       final pageFetch = state.fetchArgs.last;
       expect(pageFetch.start, 200);
@@ -247,7 +256,6 @@ void main() {
           onState: (s) => state = s,
           fetcher: (start, size, abort) async {
             if (start == 0) {
-              // Initial page always succeeds so totalSize > 0.
               return _result(start: 0, size: size, totalSize: 400);
             }
             rangeAttempt++;
@@ -255,7 +263,6 @@ void main() {
               // First range fetch fails — triggers retry path.
               throw MediaServerHttpException(type: MediaServerHttpErrorType.connectionError, message: 'boom');
             }
-            // Retry fetch succeeds.
             return _result(start: start, size: size, totalSize: 400);
           },
         ),
@@ -272,9 +279,13 @@ void main() {
       // Drain the failed Future, then advance past the retry timer's 1s delay
       // so the timer fires and re-invokes ensureIndexLoaded.
       await tester.pump();
+      expect(state.paginationError, isA<MediaServerHttpException>());
+      expect(state.isPaginationLoading, isFalse);
       await tester.pump(const Duration(milliseconds: 1100));
       // Drain the retry's Future.
       await tester.pump();
+      expect(state.paginationError, isNull);
+      expect(state.isPaginationLoading, isFalse);
 
       expect(state.loadedItems.containsKey(220), isTrue);
       expect(rangeAttempt, greaterThanOrEqualTo(2)); // failed + retry
@@ -311,7 +322,6 @@ void main() {
       // we'd see another fetch attempt.
       await tester.pump(const Duration(milliseconds: 1500));
 
-      // Only the failed fetch happened — no retry on cancellation.
       expect(state.fetchCalls, beforeFetches + 1);
     });
 
@@ -398,7 +408,6 @@ void main() {
         ),
       );
 
-      // No initial load — totalSize stays 0.
       state.removeLoadedItemAndShift(0);
       expect(state.totalSize, 0);
     });

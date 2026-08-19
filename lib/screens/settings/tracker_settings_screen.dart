@@ -7,6 +7,7 @@ import '../../models/trackers/device_code.dart';
 import '../../providers/trackers_provider.dart';
 import '../../services/trackers/anilist/anilist_tracker.dart';
 import '../../services/trackers/mal/mal_tracker.dart';
+import '../../services/trackers/mdblist/mdblist_tracker.dart';
 import '../../services/trackers/oauth_proxy_client.dart';
 import '../../services/trackers/simkl/simkl_tracker.dart';
 import '../../services/trackers/tracker_constants.dart';
@@ -60,6 +61,20 @@ Future<void> startSimklConnection(BuildContext context) {
   );
 }
 
+Future<void> startMdblistConnection(BuildContext context) {
+  final account = context.read<TrackersProvider>();
+  final name = t.services.names.mdblist;
+  return launchTrackerConnect<DeviceCode>(
+    context,
+    isBusyOrConnected: account.isConnecting(TrackerService.mdblist) || account.isMdblistConnected,
+    serviceName: name,
+    connect: (cb) => account.connectMdblist(onCodeReady: cb),
+    onCancel: account.cancelConnect,
+    buildDialog: (p, cancel) => DeviceCodeDialog(code: p, serviceName: name, onCancel: cancel),
+    urlFor: (p) => p.verificationUrlComplete ?? p.verificationUrl,
+  );
+}
+
 /// Per-service wiring for [TrackerSettingsScreen]. Keeps tracker-specific
 /// method names out of the shared screen body.
 class TrackerConfig {
@@ -67,7 +82,6 @@ class TrackerConfig {
   final String displayName;
   final bool Function(TrackersProvider) isConnected;
   final String? Function(TrackersProvider) username;
-  final Pref<bool> scrobblePref;
   final Future<void> Function(bool) onScrobbleChanged;
   final Future<void> Function(TrackersProvider) disconnect;
 
@@ -76,17 +90,17 @@ class TrackerConfig {
     required this.displayName,
     required this.isConnected,
     required this.username,
-    required this.scrobblePref,
     required this.onScrobbleChanged,
     required this.disconnect,
   });
+
+  Pref<bool> get scrobblePref => SettingsService.scrobblePref(service);
 
   static TrackerConfig mal() => TrackerConfig(
     service: TrackerService.mal,
     displayName: t.services.names.mal,
     isConnected: (a) => a.isMalConnected,
     username: (a) => a.malUsername,
-    scrobblePref: SettingsService.enableMalScrobble,
     onScrobbleChanged: MalTracker.instance.setEnabled,
     disconnect: (a) => a.disconnectMal(),
   );
@@ -96,7 +110,6 @@ class TrackerConfig {
     displayName: t.services.names.anilist,
     isConnected: (a) => a.isAnilistConnected,
     username: (a) => a.anilistUsername,
-    scrobblePref: SettingsService.enableAnilistScrobble,
     onScrobbleChanged: AnilistTracker.instance.setEnabled,
     disconnect: (a) => a.disconnectAnilist(),
   );
@@ -106,15 +119,23 @@ class TrackerConfig {
     displayName: t.services.names.simkl,
     isConnected: (a) => a.isSimklConnected,
     username: (a) => a.simklUsername,
-    scrobblePref: SettingsService.enableSimklScrobble,
     onScrobbleChanged: SimklTracker.instance.setEnabled,
     disconnect: (a) => a.disconnectSimkl(),
   );
+
+  static TrackerConfig mdblist() => TrackerConfig(
+    service: TrackerService.mdblist,
+    displayName: t.services.names.mdblist,
+    isConnected: (a) => a.isMdblistConnected,
+    username: (a) => a.mdblistUsername,
+    onScrobbleChanged: MdblistTracker.instance.setEnabled,
+    disconnect: (a) => a.disconnectMdblist(),
+  );
 }
 
-/// Shared settings screen for MAL, AniList, and Simkl. Only reachable while
-/// connected — if the session drops (refresh failure, back-nav race) we pop
-/// back to the hub.
+/// Shared settings screen for MAL, AniList, Simkl and MDBList. Only reachable
+/// while connected — if the session drops (refresh failure, back-nav race) we
+/// pop back to the hub.
 class TrackerSettingsScreen extends StatelessWidget {
   final TrackerConfig config;
   const TrackerSettingsScreen({super.key, required this.config});

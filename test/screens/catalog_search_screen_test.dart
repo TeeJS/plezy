@@ -1,17 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:intl/date_symbol_data_local.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:plezy/i18n/strings.g.dart';
 import 'package:plezy/media/media_item.dart';
 import 'package:plezy/media/media_kind.dart';
 import 'package:plezy/models/catalog/catalog_item.dart';
-import 'package:plezy/models/catalog/catalog_cast_member.dart';
+import 'package:plezy/models/catalog/catalog_metadata.dart';
 import 'package:plezy/providers/catalog_sources_provider.dart';
-import 'package:plezy/providers/multi_server_provider.dart';
 import 'package:plezy/screens/catalog_item_detail_screen.dart';
 import 'package:plezy/screens/catalog_search_screen.dart';
 import 'package:plezy/services/catalog/catalog_source.dart';
 import 'package:plezy/services/catalog/catalog_library_matcher.dart';
-import 'package:plezy/services/data_aggregation_service.dart';
 import 'package:plezy/services/multi_server_manager.dart';
 import 'package:plezy/services/settings_service.dart';
 import 'package:plezy/theme/mono_theme.dart';
@@ -19,12 +18,14 @@ import 'package:plezy/widgets/app_menu.dart';
 import 'package:plezy/widgets/media_card.dart';
 import 'package:provider/provider.dart';
 
+import '../test_helpers/multi_server_fixtures.dart';
 import '../test_helpers/prefs.dart';
 
 /// Only the members the search screen touches; everything else throws.
 class _FakeSearchSource implements CatalogSource {
   final queries = <String>[];
   bool failNext = false;
+  CatalogItem? result;
 
   @override
   CatalogSourceId get id => CatalogSourceId.trakt;
@@ -43,15 +44,14 @@ class _FakeSearchSource implements CatalogSource {
       throw Exception('boom');
     }
     return [
-      CatalogItem(source: id, kind: MediaKind.movie, title: 'result: $query', ids: const CatalogItemIds(tmdb: 1)),
+      result ??
+          CatalogItem(source: id, kind: MediaKind.movie, title: 'result: $query', ids: const CatalogItemIds(tmdb: 1)),
     ];
   }
 
   @override
-  Future<List<CatalogCastMember>> fetchCast(CatalogItem item, {int limit = 20}) async => const [];
-
-  @override
-  Future<List<CatalogItem>> fetchRelated(CatalogItem item, {int limit = 20}) async => const [];
+  Future<CatalogDetail> fetchDetail(CatalogItem item, {int castLimit = 20, int relatedLimit = 20}) async =>
+      CatalogDetail(item: item);
 
   @override
   void dispose() {}
@@ -74,8 +74,10 @@ Future<void> _pump(WidgetTester tester, _FakeSearchSource source) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  setUpAll(() {
+  setUpAll(() async {
     LocaleSettings.setLocaleSync(AppLocale.en);
+    // Catalog result cards format dates; `main.dart` does this at startup.
+    await initializeDateFormatting('en');
   });
 
   setUp(() async {
@@ -167,6 +169,30 @@ void main() {
     expect(_appMenuList(), findsNothing);
     expect(find.byType(CatalogItemDetailScreen), findsOneWidget);
   });
+
+  testWidgets('catalog result menu exposes trailer and provider links', (tester) async {
+    final source = _FakeSearchSource()
+      ..result = const CatalogItem(
+        source: CatalogSourceId.trakt,
+        kind: MediaKind.movie,
+        title: 'result: menu',
+        ids: CatalogItemIds(tmdb: 1),
+        trailerUrl: 'https://example.com/trailer',
+        links: [
+          CatalogLink(label: 'Trakt', url: 'https://example.com/trakt'),
+          CatalogLink(label: 'Stream Co', url: 'https://example.com/watch', isStreaming: true),
+        ],
+      );
+    await _pumpMenuSearch(tester, source, platform: TargetPlatform.macOS);
+    await _searchForMenuResult(tester);
+
+    tester.state<MediaCardState>(find.byType(MediaCard)).showContextMenu();
+    await tester.pumpAndSettle();
+
+    expect(find.text(t.explore.detail.watchTrailer), findsOneWidget);
+    expect(find.text(t.explore.detail.openOn(site: 'Trakt')), findsOneWidget);
+    expect(find.text(t.explore.detail.openOn(site: 'Stream Co')), findsOneWidget);
+  });
 }
 
 dynamic _state(WidgetTester tester) => tester.state<State<CatalogSearchScreen>>(find.byType(CatalogSearchScreen));
@@ -197,7 +223,7 @@ Future<void> _pumpMenuSearch(WidgetTester tester, _FakeSearchSource source, {req
 
   final sources = _FakeCatalogSourcesProvider(source);
   final manager = MultiServerManager();
-  final multiServer = MultiServerProvider(manager, DataAggregationService(manager));
+  final multiServer = testMultiServerProvider(manager);
   final matcher = _FakeCatalogLibraryMatcher(multiServer);
   addTearDown(manager.dispose);
   addTearDown(multiServer.dispose);

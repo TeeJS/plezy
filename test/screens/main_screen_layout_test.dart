@@ -69,18 +69,20 @@ void main() {
     expect(shouldPass(isOverlaySheetOpen: true), isFalse);
     expect(shouldPass(isRouteCurrent: false), isFalse);
     expect(shouldPass(isAppleTV: false), isFalse);
+    expect(shouldPass(isShowingProfileSelection: true), isFalse);
+    expect(shouldPass(hasVisibleTabs: false), isFalse);
   });
 
-  test('macOS physical Escape is reserved for native fullscreen only at root Home', () {
+  test('desktop physical Escape is reserved for window fullscreen only at root Home', () {
     bool shouldHandle({
-      bool isMacOS = true,
+      bool isDesktop = true,
       bool isPhysicalKeyboardEvent = true,
       LogicalKeyboardKey logicalKey = LogicalKeyboardKey.escape,
       bool isCurrentRoute = true,
       bool isHomeTab = true,
     }) {
-      return shouldHandleMacOsRootEscape(
-        isMacOS: isMacOS,
+      return shouldHandleDesktopRootEscape(
+        isDesktop: isDesktop,
         isPhysicalKeyboardEvent: isPhysicalKeyboardEvent,
         logicalKey: logicalKey,
         isCurrentRoute: isCurrentRoute,
@@ -91,8 +93,10 @@ void main() {
     expect(shouldHandle(), isTrue);
     expect(shouldHandle(isHomeTab: false), isFalse);
     expect(shouldHandle(isCurrentRoute: false), isFalse);
+    // A remote/gamepad-synthesized escape is not a physical keyboard Escape;
+    // it keeps the press-back-again exit path.
     expect(shouldHandle(isPhysicalKeyboardEvent: false), isFalse);
-    expect(shouldHandle(isMacOS: false), isFalse);
+    expect(shouldHandle(isDesktop: false), isFalse);
     expect(shouldHandle(logicalKey: LogicalKeyboardKey.gameButtonB), isFalse);
   });
 
@@ -128,6 +132,44 @@ void main() {
       ),
       ProfileInvalidationAction.none,
     );
+  });
+
+  group('ProfileSelectionResumeGate', () {
+    test('does not prompt for overlay-style focus loss and regain (#1990)', () {
+      final gate = ProfileSelectionResumeGate();
+      expect(gate.consumePromptOn(AppLifecycleState.inactive), isFalse);
+      expect(gate.consumePromptOn(AppLifecycleState.resumed), isFalse);
+    });
+
+    test('prompts exactly once after a genuine backgrounding', () {
+      final gate = ProfileSelectionResumeGate();
+      expect(gate.consumePromptOn(AppLifecycleState.inactive), isFalse);
+      expect(gate.consumePromptOn(AppLifecycleState.paused), isFalse);
+      expect(gate.wasBackgrounded, isTrue);
+      expect(gate.consumePromptOn(AppLifecycleState.resumed), isTrue);
+      expect(gate.consumePromptOn(AppLifecycleState.resumed), isFalse);
+      expect(gate.wasBackgrounded, isFalse);
+    });
+
+    test('prompts after an iOS-style hidden -> inactive -> resumed return', () {
+      final gate = ProfileSelectionResumeGate();
+      expect(gate.consumePromptOn(AppLifecycleState.hidden), isFalse);
+      expect(gate.consumePromptOn(AppLifecycleState.inactive), isFalse);
+      expect(gate.consumePromptOn(AppLifecycleState.resumed), isTrue);
+    });
+
+    test('latches every backgrounding state', () {
+      for (final state in [AppLifecycleState.hidden, AppLifecycleState.paused, AppLifecycleState.detached]) {
+        final gate = ProfileSelectionResumeGate();
+        expect(gate.consumePromptOn(state), isFalse);
+        expect(gate.consumePromptOn(AppLifecycleState.resumed), isTrue, reason: '$state');
+      }
+    });
+
+    test('does not prompt without a prior backgrounding (cold open)', () {
+      final gate = ProfileSelectionResumeGate();
+      expect(gate.consumePromptOn(AppLifecycleState.resumed), isFalse);
+    });
   });
 
   testWidgets('side navigation bleed animates from the previous value', (tester) async {

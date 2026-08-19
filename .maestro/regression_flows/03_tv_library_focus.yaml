@@ -22,14 +22,22 @@ tags:
 - pressKey: "Remote Dpad Up"
 - pressKey: "Remote Dpad Right"
 - pressKey: "Remote Dpad Right"
+# Wait for the row before opening the sheet so occlusion is tested against the
+# grid, not an absent or stale match.
+- extendedWaitUntil:
+    visible: "(?s).*Alpha Archive.*"
+    timeout: 15000
 - pressKey: "Remote Dpad Center"
 - extendedWaitUntil:
     visible: "Title"
     timeout: 10000
+# The grid remains mounted under the Stack; BlockSemantics is required for
+# occluded rows to disappear from Maestro's accessibility tree.
+- assertNotVisible: "(?s).*Alpha Archive.*"
 - pressKey: "Remote Dpad Center"
 - pressKey: "Remote Dpad Left"
 - extendedWaitUntil:
-    notVisible: "Sort by"
+    notVisible: "Sort By"
     timeout: 10000
 - pressKey: "Remote Dpad Down"
 - extendedWaitUntil:

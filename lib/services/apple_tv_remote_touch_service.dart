@@ -1,9 +1,10 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import '../focus/focus_navigation_intent.dart';
+import '../focus/input_mode_tracker.dart';
 import '../utils/app_logger.dart';
 import '../utils/key_event_simulator.dart' as key_sim;
 import 'gamepad_service.dart';
@@ -17,81 +18,71 @@ class AppleTvRemotePlayPauseAction {
   const AppleTvRemotePlayPauseAction({required this.source, this.detail});
 }
 
+const double _axisSwitchDominanceRatio = 1.5;
+const Duration _swipeRepeatInterval = Duration(milliseconds: 140);
+// Device-tuned on an Apple TV 4K against native focus feel: UIKit's
+// indirect-touch acceleration means roughly half an item's extent of
+// reported travel already reads as "one deliberate swipe".
+const double _swipeExtentGain = 0.55;
+const double _maxSwipeThreshold = 180;
+
 /// Bridges tvOS touch-surface events from Apple's iOS Remote app into the
 /// focus-tree key events Plezy already handles for D-pad navigation.
+///
+/// Like the native focus engine, the pan distance for one focus step follows
+/// the focused control's on-screen size: small chips traverse quickly, large
+/// cards demand a longer swipe. When no usable geometry exists (a bare focus
+/// scope, the video player's screen-sized catch-all surfaces) the step falls
+/// back to a fixed threshold.
 class AppleTvRemoteTouchService {
   static const String _channelName = 'flutter/gamepadtouchevent';
   static const double defaultSwipeThreshold = 180;
-  static const double defaultAxisSwitchDominanceRatio = 1.5;
-  static const Duration defaultSwipeRepeatInterval = Duration(milliseconds: 140);
-  static const Duration defaultClickAfterDirectionSuppression = Duration(milliseconds: 220);
+  static const double defaultMinSwipeThreshold = 50;
 
   static final AppleTvRemoteTouchService instance = AppleTvRemoteTouchService();
 
-  final BasicMessageChannel<dynamic> _channel;
+  final BasicMessageChannel<dynamic> _channel = const BasicMessageChannel<dynamic>(_channelName, JSONMessageCodec());
   final void Function(LogicalKeyboardKey logicalKey) _simulateKeyPress;
-  final void Function(LogicalKeyboardKey logicalKey) _simulateKeyDown;
-  final void Function(LogicalKeyboardKey logicalKey) _simulateKeyUp;
   final VoidCallback _scheduleFrame;
   final DateTime Function() _now;
   final GamepadDuplicateInputGuard _duplicateInputGuard;
+
   final StreamController<AppleTvRemotePlayPauseAction> _playPauseController =
       StreamController<AppleTvRemotePlayPauseAction>.broadcast();
+
+  /// Fallback step distance when no usable focus geometry exists.
   final double swipeThreshold;
-  final double axisSwitchDominanceRatio;
-  final Duration swipeRepeatInterval;
-  final Duration clickAfterDirectionSuppression;
+  final double minSwipeThreshold;
+
+  /// Global rect of the control that prices a focus step, or null when no
+  /// usable geometry exists. Injected so tests can supply fake geometry.
+  final Rect? Function() _focusedItemRect;
 
   bool _listening = false;
   bool _nativeKeyHandlerRegistered = false;
   bool _touchActive = false;
-  final ValueNotifier<bool> _touchActiveNotifier = ValueNotifier<bool>(false);
   double _startX = 0;
   double _startY = 0;
   double _anchorX = 0;
   double _anchorY = 0;
   _SwipeAxis? _lastSwipeAxis;
   DateTime? _lastSwipeAt;
-  DateTime? _lastDirectionalInputAt;
-  DateTime? _lastSyntheticSelectAt;
-  DateTime? _lastAcceptedNativeSelectDownAt;
-  DateTime? _lastAcceptedNativeSelectUpAt;
-  int _suppressedNativeSelectDowns = 0;
-  bool _nativeSelectPressed = false;
-  bool _selectPressedFromClick = false;
 
   AppleTvRemoteTouchService({
-    BasicMessageChannel<dynamic>? channel,
     void Function(LogicalKeyboardKey logicalKey)? simulateKeyPress,
-    void Function(LogicalKeyboardKey logicalKey)? simulateKeyDown,
-    void Function(LogicalKeyboardKey logicalKey)? simulateKeyUp,
     VoidCallback? scheduleFrame,
     DateTime Function()? now,
-    GamepadDuplicateInputGuard? duplicateInputGuard,
-    Duration duplicateSuppressionWindow = GamepadDuplicateInputGuard.defaultSuppressionWindow,
     this.swipeThreshold = defaultSwipeThreshold,
-    this.axisSwitchDominanceRatio = defaultAxisSwitchDominanceRatio,
-    this.swipeRepeatInterval = defaultSwipeRepeatInterval,
-    this.clickAfterDirectionSuppression = defaultClickAfterDirectionSuppression,
-  }) : assert(axisSwitchDominanceRatio >= 1),
-       _channel = channel ?? const BasicMessageChannel<dynamic>(_channelName, JSONMessageCodec()),
+    this.minSwipeThreshold = defaultMinSwipeThreshold,
+    Rect? Function()? focusedItemRect,
+  }) : assert(minSwipeThreshold > 0 && minSwipeThreshold <= _maxSwipeThreshold),
        _simulateKeyPress = simulateKeyPress ?? key_sim.simulateKeyPress,
-       _simulateKeyDown = simulateKeyDown ?? key_sim.simulateKeyDown,
-       _simulateKeyUp = simulateKeyUp ?? key_sim.simulateKeyUp,
        _scheduleFrame = scheduleFrame ?? key_sim.scheduleFrameIfIdle,
        _now = now ?? DateTime.now,
-       _duplicateInputGuard =
-           duplicateInputGuard ?? GamepadDuplicateInputGuard(now: now, suppressionWindow: duplicateSuppressionWindow);
+       _focusedItemRect = focusedItemRect ?? _defaultFocusedItemRect,
+       _duplicateInputGuard = GamepadDuplicateInputGuard(now: now);
 
   Stream<AppleTvRemotePlayPauseAction> get playPauseActions => _playPauseController.stream;
-
-  /// Whether a Siri-remote touch gesture is currently in progress (finger down).
-  /// Cleared when the touch ends or cancels. tvOS-only; `false` elsewhere.
-  bool get isTouchActive => _touchActive;
-
-  /// Listenable mirror of [isTouchActive] so widgets can react when the active
-  /// touch gesture ends (used to extend Home-rail select suppression).
-  ValueListenable<bool> get touchActiveListenable => _touchActiveNotifier;
 
   void start() {
     if (_listening) return;
@@ -106,8 +97,6 @@ class AppleTvRemoteTouchService {
     _channel.setMessageHandler(null);
     _unregisterNativeKeyHandler();
     _duplicateInputGuard.clear();
-    _resetNativeSelectBurstState();
-    _releaseSelectFromClick(source: 'stop');
     _resetTouch();
     _listening = false;
   }
@@ -117,12 +106,6 @@ class AppleTvRemoteTouchService {
     if (_isMediaPlaybackKey(event.logicalKey)) {
       _log('consume native media key reason=direct-playback-action');
       return true;
-    }
-    if (_shouldConsumeNativeSelectDuplicate(event)) {
-      return true;
-    }
-    if (event is KeyDownEvent && _isDirectionalKey(event.logicalKey)) {
-      _lastDirectionalInputAt = _now();
     }
     return _duplicateInputGuard.handleNativeKeyEvent(event);
   }
@@ -159,10 +142,6 @@ class AppleTvRemoteTouchService {
         _resetTouch();
       case 'cancelled':
         _resetTouch();
-      case 'click_e':
-        _releaseSelectFromClick(source: 'click_e');
-      case 'click_s':
-        _pressSelectFromClick();
       case 'play_pause':
         final source = arguments['source'] is String ? arguments['source'] as String : 'native';
         final detail = arguments['detail'] is String ? arguments['detail'] as String : null;
@@ -189,7 +168,6 @@ class AppleTvRemoteTouchService {
 
   void _startTouch(double x, double y) {
     _touchActive = true;
-    _touchActiveNotifier.value = true;
     _startX = x;
     _startY = y;
     _anchorX = x;
@@ -206,12 +184,19 @@ class AppleTvRemoteTouchService {
 
     final deltaX = _anchorX - x;
     final deltaY = _anchorY - y;
-    final axis = _resolveSwipeAxis(x: x, y: y, deltaX: deltaX, deltaY: deltaY);
-    if (axis == null) return;
 
     final now = _now();
     final lastSwipeAt = _lastSwipeAt;
-    if (lastSwipeAt != null && now.difference(lastSwipeAt) < swipeRepeatInterval) {
+    if (lastSwipeAt != null && now.difference(lastSwipeAt) < _swipeRepeatInterval) {
+      // Travel during the repeat cooldown never counts toward the next step:
+      // re-anchor on every frame so a fast flick's deceleration tail is
+      // discarded instead of banked. Without this, the first post-cooldown
+      // move frame — even a stationary or lift-drift one — released the
+      // banked delta as a second focus step for a single intentional swipe.
+      // A deliberate continuous drag still repeats because it covers a fresh
+      // swipe threshold after each cooldown expires.
+      _anchorX = x;
+      _anchorY = y;
       final age = now.difference(lastSwipeAt).inMilliseconds;
       _log(
         'suppress swipe reason=repeat-cooldown age=${age}ms dx=${_formatDouble(deltaX)} dy=${_formatDouble(deltaY)}',
@@ -219,188 +204,90 @@ class AppleTvRemoteTouchService {
       return;
     }
 
+    final thresholds = _stepThresholds();
+    final axis = _resolveSwipeAxis(x: x, y: y, deltaX: deltaX, deltaY: deltaY, thresholds: thresholds);
+    if (axis == null) return;
+
     final logicalKey = axis == _SwipeAxis.horizontal
         ? (deltaX >= 0 ? LogicalKeyboardKey.arrowLeft : LogicalKeyboardKey.arrowRight)
         : (deltaY >= 0 ? LogicalKeyboardKey.arrowUp : LogicalKeyboardKey.arrowDown);
 
-    _emitKey(logicalKey, source: 'swipe', detail: 'dx=${_formatDouble(deltaX)} dy=${_formatDouble(deltaY)}');
+    _emitKey(
+      logicalKey,
+      source: 'swipe',
+      detail:
+          'dx=${_formatDouble(deltaX)} dy=${_formatDouble(deltaY)} '
+          'thX=${_formatDouble(thresholds.horizontal)} thY=${_formatDouble(thresholds.vertical)}',
+    );
     _anchorX = x;
     _anchorY = y;
     _lastSwipeAxis = axis;
     _lastSwipeAt = now;
   }
 
+  /// Resolves which axis, if any, crossed its step threshold.
+  ///
+  /// Distances are normalized by the per-axis thresholds so that, like the
+  /// native focus engine, a wide-flat control steps vertically once the finger
+  /// covers the item's height even while the raw horizontal delta is larger.
   _SwipeAxis? _resolveSwipeAxis({
     required double x,
     required double y,
     required double deltaX,
     required double deltaY,
+    required ({double horizontal, double vertical}) thresholds,
   }) {
-    final absX = deltaX.abs();
-    final absY = deltaY.abs();
-    if (absX < swipeThreshold && absY < swipeThreshold) return null;
+    final progressX = deltaX.abs() / thresholds.horizontal;
+    final progressY = deltaY.abs() / thresholds.vertical;
+    if (progressX < 1 && progressY < 1) return null;
 
-    final candidate = absX >= absY ? _SwipeAxis.horizontal : _SwipeAxis.vertical;
+    final candidate = progressX >= progressY ? _SwipeAxis.horizontal : _SwipeAxis.vertical;
     final lastAxis = _lastSwipeAxis;
     if (lastAxis == null || candidate == lastAxis) return candidate;
 
-    final totalX = (_startX - x).abs();
-    final totalY = (_startY - y).abs();
-    final candidateTotal = _axisDistance(candidate, totalX, totalY);
-    final lastAxisTotal = _axisDistance(lastAxis, totalX, totalY);
-    final candidateSegment = _axisDistance(candidate, absX, absY);
-    final lastAxisSegment = _axisDistance(lastAxis, absX, absY);
-    if (candidateTotal >= lastAxisTotal * axisSwitchDominanceRatio &&
-        candidateSegment >= lastAxisSegment * axisSwitchDominanceRatio) {
+    final totalProgressX = (_startX - x).abs() / thresholds.horizontal;
+    final totalProgressY = (_startY - y).abs() / thresholds.vertical;
+    final candidateTotal = _axisValue(candidate, totalProgressX, totalProgressY);
+    final lastAxisTotal = _axisValue(lastAxis, totalProgressX, totalProgressY);
+    final candidateSegment = _axisValue(candidate, progressX, progressY);
+    final lastAxisSegment = _axisValue(lastAxis, progressX, progressY);
+    if (candidateTotal >= lastAxisTotal * _axisSwitchDominanceRatio &&
+        candidateSegment >= lastAxisSegment * _axisSwitchDominanceRatio) {
       return candidate;
     }
 
-    return lastAxisSegment >= swipeThreshold ? lastAxis : null;
+    return lastAxisSegment >= 1 ? lastAxis : null;
   }
 
-  double _axisDistance(_SwipeAxis axis, double horizontal, double vertical) {
+  double _axisValue(_SwipeAxis axis, double horizontal, double vertical) {
     return axis == _SwipeAxis.horizontal ? horizontal : vertical;
   }
 
-  void _pressSelectFromClick() {
-    final now = _now();
-    final lastDirectionalInputAt = _lastDirectionalInputAt;
-    if (lastDirectionalInputAt != null && now.difference(lastDirectionalInputAt) <= clickAfterDirectionSuppression) {
-      final age = now.difference(lastDirectionalInputAt).inMilliseconds;
-      _log('suppress key=${_keyName(LogicalKeyboardKey.enter)} source=click_s reason=recent-direction age=${age}ms');
-      return;
-    }
-
-    final lastSyntheticSelectAt = _lastSyntheticSelectAt;
-    if (lastSyntheticSelectAt != null && now.difference(lastSyntheticSelectAt).abs() <= duplicateSuppressionWindow) {
-      final age = now.difference(lastSyntheticSelectAt).abs().inMilliseconds;
-      _log(
-        'suppress key=${_keyName(LogicalKeyboardKey.enter)} source=click_s reason=recent-synthetic-select age=${age}ms',
-      );
-      return;
-    }
-
-    if (_duplicateInputGuard.shouldSuppressSyntheticKey(LogicalKeyboardKey.enter)) {
-      _log('suppress key=${_keyName(LogicalKeyboardKey.enter)} source=click_s reason=recent-native');
-      return;
-    }
-
-    _setTraditionalFocusHighlight();
-    _scheduleFrame();
-    _selectPressedFromClick = true;
-    _log('emit keydown=${_keyName(LogicalKeyboardKey.enter)} source=click_s');
-    _simulateKeyDown(LogicalKeyboardKey.enter);
+  ({double horizontal, double vertical}) _stepThresholds() {
+    final rect = _focusedItemRect();
+    if (rect == null) return (horizontal: swipeThreshold, vertical: swipeThreshold);
+    return (horizontal: _thresholdForExtent(rect.width), vertical: _thresholdForExtent(rect.height));
   }
 
-  void _releaseSelectFromClick({required String source}) {
-    if (!_selectPressedFromClick) {
-      _log('ignore keyup=${_keyName(LogicalKeyboardKey.enter)} source=$source reason=no-click-select-down');
-      return;
-    }
-
-    _setTraditionalFocusHighlight();
-    _scheduleFrame();
-    _selectPressedFromClick = false;
-    _lastSyntheticSelectAt = _now();
-    _log('emit keyup=${_keyName(LogicalKeyboardKey.enter)} source=$source');
-    _simulateKeyUp(LogicalKeyboardKey.enter);
+  double _thresholdForExtent(double extent) {
+    if (!extent.isFinite || extent <= 0) return swipeThreshold;
+    return (extent * _swipeExtentGain).clamp(minSwipeThreshold, _maxSwipeThreshold).toDouble();
   }
 
-  bool _shouldConsumeNativeSelectDuplicate(KeyEvent event) {
-    if (!_isSelectKey(event.logicalKey)) return false;
-
-    final now = _now();
-    if (_selectPressedFromClick) {
-      _log(
-        'consume native ${_eventTypeName(event)} logical=${_keyName(event.logicalKey)} '
-        'reason=synthetic-select-in-flight',
-      );
-      if (event is KeyUpEvent) {
-        _releaseSelectFromClick(source: 'native_select');
-      }
-      return true;
-    }
-
-    final lastSyntheticSelectAt = _lastSyntheticSelectAt;
-    if (lastSyntheticSelectAt != null && now.difference(lastSyntheticSelectAt).abs() <= duplicateSuppressionWindow) {
-      final age = now.difference(lastSyntheticSelectAt).abs().inMilliseconds;
-      _log(
-        'consume native ${_eventTypeName(event)} logical=${_keyName(event.logicalKey)} '
-        'reason=recent-synthetic-select age=${age}ms',
-      );
-      return true;
-    }
-
-    if (event is KeyDownEvent) {
-      final lastAcceptedNativeSelectUpAt = _lastAcceptedNativeSelectUpAt;
-      final duplicateCompletedPress =
-          lastAcceptedNativeSelectUpAt != null &&
-          now.difference(lastAcceptedNativeSelectUpAt).abs() <= duplicateSuppressionWindow;
-      if (_nativeSelectPressed || duplicateCompletedPress) {
-        _suppressedNativeSelectDowns++;
-        final reason = _nativeSelectPressed ? 'native-select-already-down' : 'recent-native-select';
-        _log(
-          'consume native ${_eventTypeName(event)} logical=${_keyName(event.logicalKey)} '
-          'reason=$reason',
-        );
-        return true;
-      }
-
-      _nativeSelectPressed = true;
-      _lastAcceptedNativeSelectDownAt = now;
-      return false;
-    }
-
-    if (event is KeyRepeatEvent) {
-      if (_nativeSelectPressed) return false;
-      final lastAcceptedNativeSelectDownAt = _lastAcceptedNativeSelectDownAt;
-      if (lastAcceptedNativeSelectDownAt != null &&
-          now.difference(lastAcceptedNativeSelectDownAt).abs() <= duplicateSuppressionWindow) {
-        _log(
-          'consume native ${_eventTypeName(event)} logical=${_keyName(event.logicalKey)} '
-          'reason=recent-native-select',
-        );
-        return true;
-      }
-      return false;
-    }
-
-    if (event is KeyUpEvent) {
-      if (_suppressedNativeSelectDowns > 0) {
-        _suppressedNativeSelectDowns--;
-        _log(
-          'consume native ${_eventTypeName(event)} logical=${_keyName(event.logicalKey)} '
-          'reason=suppressed-native-select-down',
-        );
-        return true;
-      }
-
-      if (!_nativeSelectPressed) {
-        final lastAcceptedNativeSelectUpAt = _lastAcceptedNativeSelectUpAt;
-        if (lastAcceptedNativeSelectUpAt != null &&
-            now.difference(lastAcceptedNativeSelectUpAt).abs() <= duplicateSuppressionWindow) {
-          _log(
-            'consume native ${_eventTypeName(event)} logical=${_keyName(event.logicalKey)} '
-            'reason=recent-native-select-up',
-          );
-          return true;
-        }
-        return false;
-      }
-
-      _nativeSelectPressed = false;
-      _lastAcceptedNativeSelectUpAt = now;
-      return false;
-    }
-
-    return false;
-  }
-
-  void _resetNativeSelectBurstState() {
-    _lastAcceptedNativeSelectDownAt = null;
-    _lastAcceptedNativeSelectUpAt = null;
-    _suppressedNativeSelectDowns = 0;
-    _nativeSelectPressed = false;
+  /// Reads the primary focus geometry, rejecting nodes whose rect cannot
+  /// meaningfully price a step: bare scopes (nothing real is focused yet) and
+  /// the player's catch-all [DirectionalShortcutFocusNode] surfaces are
+  /// screen-sized, and a detached or unlaid-out node has no rect at all.
+  static Rect? _defaultFocusedItemRect() {
+    final node = FocusManager.instance.primaryFocus;
+    if (node == null || node is FocusScopeNode || node is DirectionalShortcutFocusNode) return null;
+    final context = node.context;
+    if (context == null) return null;
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.attached || !renderObject.hasSize) return null;
+    final rect = node.rect;
+    if (!rect.isFinite || rect.isEmpty) return null;
+    return rect;
   }
 
   bool _emitKey(LogicalKeyboardKey logicalKey, {required String source, String? detail}) {
@@ -409,21 +296,15 @@ class AppleTvRemoteTouchService {
       return false;
     }
 
-    _setTraditionalFocusHighlight();
+    InputModeTracker.reportNonPointerInput();
     _scheduleFrame();
     _log('emit key=${_keyName(logicalKey)} source=$source${detail == null ? '' : ' $detail'}');
-    if (_isDirectionalKey(logicalKey)) {
-      _lastDirectionalInputAt = _now();
-    }
     _simulateKeyPress(logicalKey);
     return true;
   }
 
-  Duration get duplicateSuppressionWindow => _duplicateInputGuard.suppressionWindow;
-
   void _resetTouch() {
     _touchActive = false;
-    _touchActiveNotifier.value = false;
     _lastSwipeAxis = null;
     _lastSwipeAt = null;
   }
@@ -438,12 +319,6 @@ class AppleTvRemoteTouchService {
     if (!_nativeKeyHandlerRegistered) return;
     HardwareKeyboard.instance.removeHandler(handleNativeKeyEvent);
     _nativeKeyHandlerRegistered = false;
-  }
-
-  void _setTraditionalFocusHighlight() {
-    if (FocusManager.instance.highlightStrategy != FocusHighlightStrategy.alwaysTraditional) {
-      FocusManager.instance.highlightStrategy = FocusHighlightStrategy.alwaysTraditional;
-    }
   }
 
   void _logTouch(String type, Map<dynamic, dynamic> arguments) {
@@ -478,21 +353,6 @@ class AppleTvRemoteTouchService {
     if (key == LogicalKeyboardKey.mediaPause) return 'mediaPause';
     if (key == LogicalKeyboardKey.mediaPlayPause) return 'mediaPlayPause';
     return '0x${key.keyId.toRadixString(16)}';
-  }
-
-  bool _isDirectionalKey(LogicalKeyboardKey key) {
-    return key == LogicalKeyboardKey.arrowUp ||
-        key == LogicalKeyboardKey.arrowDown ||
-        key == LogicalKeyboardKey.arrowLeft ||
-        key == LogicalKeyboardKey.arrowRight;
-  }
-
-  bool _isSelectKey(LogicalKeyboardKey key) {
-    return key == LogicalKeyboardKey.enter ||
-        key.keyId == 0x0d ||
-        key == LogicalKeyboardKey.numpadEnter ||
-        key == LogicalKeyboardKey.select ||
-        key == LogicalKeyboardKey.gameButtonA;
   }
 
   bool _isMediaPlaybackKey(LogicalKeyboardKey key) {

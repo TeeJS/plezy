@@ -1,7 +1,7 @@
 :root {
   color-scheme: dark;
 
-  /* Mirrors the app's mono Material 3 theme. */
+  /* Match the app's mono Material 3 theme. */
   --color-bg: #0e0f12;
   --color-surface: #15171c;
   --color-surface-high: #1d1f25;
@@ -90,6 +90,17 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
+:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: 2px;
+}
+
+@media (forced-colors: active) {
+  :focus-visible {
+    outline-color: Highlight;
+  }
+}
+
 button,
 input,
 textarea,
@@ -136,6 +147,85 @@ ul {
 
 .flat-card {
   background: var(--color-surface);
+}
+
+.centered-page {
+  display: flex;
+  min-height: 100dvh;
+  align-items: center;
+  justify-content: center;
+  padding: var(--page-gutter);
+}
+
+.centered-card {
+  display: flex;
+  width: min(100%, 32rem);
+  flex-direction: column;
+  align-items: center;
+  border-radius: var(--radius-xl);
+  padding: clamp(2rem, 8vw, 4rem);
+  background: var(--color-surface);
+  text-align: center;
+}
+
+.card-logo {
+  display: flex;
+  width: 5rem;
+  height: 5rem;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 2rem;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-highest);
+}
+
+.card-logo img {
+  width: 2.5rem;
+  height: 2.5rem;
+}
+
+/* Pill action; use .btn-pill--icon for a leading icon. */
+.btn-pill {
+  display: inline-flex;
+  min-height: 3rem;
+  align-items: center;
+  border-radius: var(--radius-pill);
+  padding-inline: 1.25rem;
+  color: var(--color-on-primary);
+  background: var(--color-text);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  transition:
+    border-radius var(--motion-expressive) var(--ease-standard),
+    background-color var(--motion-fast) var(--ease-standard);
+}
+
+.btn-pill:hover,
+.btn-pill:focus-visible {
+  border-radius: var(--radius-md);
+  background: #fff;
+}
+
+.btn-pill--icon {
+  gap: 0.625rem;
+}
+
+.btn-pill--icon svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+/* Section constrained to the page grid. */
+.page-section {
+  width: min(100%, var(--page-width));
+  margin-inline: auto;
+  padding: clamp(4rem, 9vw, 8rem) var(--page-gutter);
+}
+
+/* Section that bleeds past the page grid. */
+.bleed-section {
+  overflow: hidden;
+  padding-block: clamp(4rem, 9vw, 8rem);
 }
 
 @keyframes fade-in-up {

@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:math';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:os_media_controls/os_media_controls.dart';
 import 'package:plezy/media/ids.dart';
@@ -8,8 +10,8 @@ import 'package:plezy/media/media_display_criteria.dart';
 import 'package:plezy/media/media_item.dart';
 import 'package:plezy/media/media_kind.dart';
 import 'package:plezy/media/media_server_client.dart';
-import 'package:plezy/media/playback_report_metadata.dart';
 import 'package:plezy/mpv/models.dart';
+import 'package:plezy/mpv/player/audio_rendering_mode.dart';
 import 'package:plezy/mpv/player/player.dart';
 import 'package:plezy/mpv/player/player_state.dart';
 import 'package:plezy/mpv/player/player_streams.dart';
@@ -20,6 +22,7 @@ import 'package:plezy/services/music/music_playback_service_impl.dart';
 import 'package:plezy/services/music/music_source_resolver.dart';
 import 'package:plezy/services/playback_coordinator.dart';
 import '../../test_helpers/media_items.dart';
+import '../../test_helpers/playback_report_fakes.dart';
 
 const _trackDuration = Duration(minutes: 3);
 
@@ -36,6 +39,22 @@ MediaItem _track(String id) => testMediaItem(
 
 String _urlFor(MediaItem track) => 'fake://${track.id}';
 
+class _CallGate {
+  final Completer<void> _entered = Completer<void>();
+  final Completer<void> _released = Completer<void>();
+
+  Future<void> get entered => _entered.future;
+
+  Future<void> block() {
+    if (!_entered.isCompleted) _entered.complete();
+    return _released.future;
+  }
+
+  void release() {
+    if (!_released.isCompleted) _released.complete();
+  }
+}
+
 /// In-memory audio player: records calls, exposes manual stream controllers
 /// so tests drive transitions/completion/errors deterministically.
 class FakePlayer implements Player {
@@ -43,6 +62,7 @@ class FakePlayer implements Player {
   final completedCtrl = StreamController<bool>.broadcast(sync: true);
   final bufferingCtrl = StreamController<bool>.broadcast(sync: true);
   final positionCtrl = StreamController<Duration>.broadcast(sync: true);
+  final playheadJumpCtrl = StreamController<Duration?>.broadcast(sync: true);
   final durationCtrl = StreamController<Duration>.broadcast(sync: true);
   final seekableCtrl = StreamController<bool>.broadcast(sync: true);
   final bufferCtrl = StreamController<Duration>.broadcast(sync: true);
@@ -65,6 +85,7 @@ class FakePlayer implements Player {
     completed: completedCtrl.stream,
     buffering: bufferingCtrl.stream,
     position: positionCtrl.stream,
+    playheadJump: playheadJumpCtrl.stream,
     duration: durationCtrl.stream,
     seekable: seekableCtrl.stream,
     buffer: bufferCtrl.stream,
@@ -89,6 +110,9 @@ class FakePlayer implements Player {
   final List<Media?> setNextCalls = [];
   final List<Duration> seeks = [];
   final List<double> volumes = [];
+  Completer<void>? playGate;
+  Completer<void>? pauseGate;
+  final List<_CallGate> _openGates = [];
 
   /// Arming these URIs throws, simulating a native setNext failure.
   final Set<String> failingSetNextUris = {};
@@ -102,15 +126,42 @@ class FakePlayer implements Player {
   /// consumed by an auto-advance ([emitTransition]).
   Media? get armed => _armedMedia;
 
+  _CallGate _gateNextOpen() {
+    final gate = _CallGate();
+    _openGates.add(gate);
+    return gate;
+  }
+
+  /// Emits a gapless advance. Deliberately leaves `state.position`/`duration`
+  /// untouched: the real player announces the transition on the event flow,
+  /// which is not ordered against the property flow — at that instant the live
+  /// state can still carry the *finished* track's playhead (#1849). Tests
+  /// model that handover with [setOutgoingPlayhead] before emitting.
   void emitTransition(String uri) {
     _armedMedia = null; // the backend advanced into the armed entry
-    _state = _state.copyWith(position: Duration.zero, duration: _trackDuration);
+    _state = _state.copyWith(completed: false);
     trackTransitionCtrl.add(uri);
+  }
+
+  /// Backdates the live state to the finished track's playhead, as the real
+  /// player still reads when a gapless transition is announced.
+  void setOutgoingPlayhead({required Duration position, required Duration duration}) {
+    _state = _state.copyWith(position: position, duration: duration);
   }
 
   void emitCompleted() {
     _state = _state.copyWith(completed: true, position: _trackDuration);
     completedCtrl.add(true);
+  }
+
+  /// Emits the real boundary contract: completed always pulses, but a
+  /// transition can follow only when the native playlist still has an arm.
+  bool emitNaturalBoundary() {
+    final armed = _armedMedia;
+    emitCompleted();
+    if (armed == null) return false;
+    emitTransition(armed.uri);
+    return true;
   }
 
   void emitError(String message) => errorCtrl.add(PlayerError(message));
@@ -125,6 +176,7 @@ class FakePlayer implements Player {
     completedCtrl.close();
     bufferingCtrl.close();
     positionCtrl.close();
+    playheadJumpCtrl.close();
     durationCtrl.close();
     seekableCtrl.close();
     bufferCtrl.close();
@@ -152,11 +204,17 @@ class FakePlayer implements Player {
   @override
   Duration get currentPosition => _state.position;
 
+  /// Set by tests that drive a gapless transition; the real player records this
+  /// as the outgoing source hands over.
+  @override
+  Duration? outgoingSourcePosition;
+
   @override
   bool get audioPassthroughActive => false;
 
+  // Audio only; there is no video output to carry HDR.
   @override
-  int? get textureId => null;
+  Future<bool> isHdrOutputSupported() async => false;
 
   @override
   String get playerType => 'fake';
@@ -167,9 +225,13 @@ class FakePlayer implements Player {
     bool play = true,
     bool isLive = false,
     List<SubtitleTrack>? externalSubtitles,
-    Duration timelineOffset = Duration.zero,
     Duration? timelineDuration,
   }) async {
+    final gate = _openGates.isEmpty ? null : _openGates.removeAt(0);
+    if (gate != null) await gate.block();
+    // PlayerNative.open uses loadfile replace, which drops any armed entry.
+    // Clear before recording the committed replacement open.
+    _armedMedia = null;
     openedUris.add(media.uri);
     _state = _state.copyWith(playing: play, completed: false, position: Duration.zero, duration: _trackDuration);
     if (play) playingCtrl.add(true);
@@ -178,6 +240,7 @@ class FakePlayer implements Player {
   @override
   Future<void> play() async {
     playCalls++;
+    await playGate?.future;
     _state = _state.copyWith(playing: true, completed: false);
     playingCtrl.add(true);
   }
@@ -185,6 +248,7 @@ class FakePlayer implements Player {
   @override
   Future<void> pause() async {
     pauseCalls++;
+    await pauseGate?.future;
     _state = _state.copyWith(playing: false);
     playingCtrl.add(false);
   }
@@ -280,6 +344,9 @@ class FakePlayer implements Player {
   Future<void> setAudioPassthrough(bool enabled) async {}
 
   @override
+  Future<AudioRenderingMode?> getAudioRenderingMode() async => null;
+
+  @override
   Future<void> setAudioNormalization(bool enabled) async {}
 
   @override
@@ -314,6 +381,7 @@ class FakePlayer implements Player {
     int subtitlePosition = 100,
     bool bold = false,
     bool italic = false,
+    bool anchorToScreen = false,
   }) async {}
 
   @override
@@ -339,18 +407,20 @@ class RecordedReport {
   final String state;
   final String itemId;
   final Duration position;
+  final Duration? duration;
 
-  const RecordedReport(this.state, this.itemId, this.position);
+  const RecordedReport(this.state, this.itemId, this.position, this.duration);
 
   @override
-  String toString() => '$state($itemId @ ${position.inSeconds}s)';
+  String toString() => '$state($itemId @ ${position.inSeconds}s/${duration?.inSeconds}s)';
 }
 
 /// Records the progress-report surface; everything else is unimplemented
 /// (the engine and tracker never touch it in these tests).
-class FakeMediaServerClient extends Fake implements MediaServerClient {
+class FakeMediaServerClient extends Fake with PlaybackReportRecorder implements MediaServerClient {
   final List<RecordedReport> reports = [];
   final List<String> markedWatched = [];
+  Completer<List<MediaItem>>? instantMixGate;
 
   Iterable<RecordedReport> reportsFor(String state) => reports.where((r) => r.state == state);
 
@@ -364,52 +434,26 @@ class FakeMediaServerClient extends Fake implements MediaServerClient {
   bool get marksWatchedOnPlaybackStopped => false;
 
   @override
+  void close() {}
+
+  @override
+  Future<List<MediaItem>> fetchInstantMix(String itemId, {int limit = 100}) {
+    return instantMixGate?.future ?? Future.value(const []);
+  }
+
+  @override
   Future<void> markWatched(MediaItem item) async {
     markedWatched.add(item.id);
   }
 
   @override
-  Future<void> reportPlaybackStarted({
-    required String itemId,
-    required Duration position,
-    Duration? duration,
-    String? playSessionId,
-    String? playMethod,
-    String? liveStreamId,
-    String? mediaSourceId,
-    int? audioStreamIndex,
-    int? subtitleStreamIndex,
-  }) async {
-    reports.add(RecordedReport('started', itemId, position));
-  }
-
-  @override
-  Future<void> reportPlaybackProgress({
-    required String itemId,
-    required Duration position,
-    required Duration duration,
-    bool isPaused = false,
-    String? playSessionId,
-    String? playMethod,
-    String? liveStreamId,
-    String? mediaSourceId,
-    int? audioStreamIndex,
-    int? subtitleStreamIndex,
-  }) async {
-    reports.add(RecordedReport(isPaused ? 'paused' : 'progress', itemId, position));
-  }
-
-  @override
-  Future<void> reportPlaybackStopped({
-    required String itemId,
-    required Duration position,
-    Duration? duration,
-    String? playSessionId,
-    String? liveStreamId,
-    String? mediaSourceId,
-    PlaybackReportMetadata report = const PlaybackReportMetadata.live(),
-  }) async {
-    reports.add(RecordedReport('stopped', itemId, position));
+  Future<void> onPlaybackReport(PlaybackReportCall call) async {
+    final state = switch (call.kind) {
+      PlaybackReportKind.started => 'started',
+      PlaybackReportKind.progress => call.isPaused ? 'paused' : 'progress',
+      PlaybackReportKind.stopped => 'stopped',
+    };
+    reports.add(RecordedReport(state, call.itemId, call.position, call.duration));
   }
 }
 
@@ -419,13 +463,24 @@ class FakeMusicSourceResolver implements MusicSourceResolver {
   final MediaServerClient? client;
   final Set<String> failingIds = {};
   final Map<String, int> resolveCounts = {};
+  final Map<String, List<_CallGate>> _resolveGates = {};
 
   /// Per-track URL overrides (e.g. content:// shapes for offline tracks).
   final Map<String, String> urlOverrides = {};
 
+  _CallGate _gateNextResolve(String trackId) {
+    final gate = _CallGate();
+    (_resolveGates[trackId] ??= []).add(gate);
+    return gate;
+  }
+
   @override
   Future<MusicSource> resolve(MediaItem track) async {
     resolveCounts[track.id] = (resolveCounts[track.id] ?? 0) + 1;
+    final gates = _resolveGates[track.id];
+    final gate = gates == null || gates.isEmpty ? null : gates.removeAt(0);
+    if (gates?.isEmpty ?? false) _resolveGates.remove(track.id);
+    if (gate != null) await gate.block();
     if (failingIds.contains(track.id)) {
       throw StateError('resolve failed for ${track.id}');
     }
@@ -465,18 +520,31 @@ class FakeMediaControlsManager extends MediaControlsManager {
     bool force = false,
   }) async {}
 
-  final List<({bool canGoNext, bool canStop, bool canSkip, bool canSetSpeed})> controlSyncs = [];
+  final List<
+    ({bool canPlayPause, bool canGoNext, bool canStop, bool canSkip, bool preferSkipOverTrackButtons, bool canSetSpeed})
+  >
+  controlSyncs = [];
 
   @override
   Future<void> setControlsEnabled({
+    bool canPlayPause = false,
     bool canGoNext = false,
     bool canGoPrevious = false,
     bool canSeek = false,
     bool canStop = false,
     bool canSkip = false,
     bool canSetSpeed = false,
+    bool preferSkipOverTrackButtons = false,
+    Duration? skipInterval,
   }) async {
-    controlSyncs.add((canGoNext: canGoNext, canStop: canStop, canSkip: canSkip, canSetSpeed: canSetSpeed));
+    controlSyncs.add((
+      canPlayPause: canPlayPause,
+      canGoNext: canGoNext,
+      canStop: canStop,
+      canSkip: canSkip,
+      preferSkipOverTrackButtons: preferSkipOverTrackButtons,
+      canSetSpeed: canSetSpeed,
+    ));
   }
 
   @override
@@ -509,14 +577,46 @@ class _GatedVolumeWriter {
   }
 }
 
+/// Queue [Random] the tests can script. Real randomness by default;
+/// [lowestDraw] makes a shuffle deterministic without depending on the SDK's
+/// seeded-PRNG sequence (which carries no cross-release guarantee).
+class _ScriptedRandom implements Random {
+  final Random _real = Random();
+  late int Function(int max) _draw = _real.nextInt;
+
+  /// Every draw picks the lowest candidate index.
+  void lowestDraw() => _draw = (_) => 0;
+
+  @override
+  int nextInt(int max) => _draw(max);
+
+  @override
+  bool nextBool() => _real.nextBool();
+
+  @override
+  double nextDouble() => _real.nextDouble();
+}
+
 class _Harness {
-  _Harness._(this.service, this.resolver, this.client, this.controls, this.players);
+  _Harness._(
+    this.service,
+    this.resolver,
+    this.client,
+    this.controls,
+    this.players,
+    this.serverManager,
+    this.queueRandom,
+  );
 
   final MusicPlaybackServiceImpl service;
   final FakeMusicSourceResolver resolver;
   final FakeMediaServerClient client;
   final FakeMediaControlsManager controls;
   final List<FakePlayer> players;
+  final MultiServerManager serverManager;
+
+  /// Drives the queue's shuffle; script it before starting a shuffled queue.
+  final _ScriptedRandom queueRandom;
 
   /// Seeded into every created FakePlayer — lets a test configure arm
   /// failures before the first player exists.
@@ -525,13 +625,15 @@ class _Harness {
   FakePlayer get player => players.last;
 
   factory _Harness.create({Future<void> Function(double)? volumePersistenceWriter}) {
+    final queueRandom = _ScriptedRandom();
     final client = FakeMediaServerClient();
     final resolver = FakeMusicSourceResolver(client: client);
     final controls = FakeMediaControlsManager();
     final players = <FakePlayer>[];
+    final serverManager = MultiServerManager()..debugRegisterClientForTesting(client);
     late final _Harness harness;
     final service = MusicPlaybackServiceImpl(
-      serverManager: MultiServerManager(),
+      serverManager: serverManager,
       resolver: resolver,
       audioPlayerFactory: () {
         final player = FakePlayer();
@@ -544,8 +646,9 @@ class _Harness {
       // paths resolve within pumpEventQueue.
       completedConfirmDelay: Duration.zero,
       volumePersistenceWriter: volumePersistenceWriter,
+      queueRandom: queueRandom,
     );
-    harness = _Harness._(service, resolver, client, controls, players);
+    harness = _Harness._(service, resolver, client, controls, players, serverManager, queueRandom);
     return harness;
   }
 
@@ -561,6 +664,10 @@ class _Harness {
 }
 
 void main() {
+  // The impl registers a HardwareKeyboard handler for foreground media keys
+  // (#1948), which needs the services binding.
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   final t1 = _track('t1');
   final t2 = _track('t2');
   final t3 = _track('t3');
@@ -579,6 +686,43 @@ void main() {
       player.closeControllers();
     }
     h.controls.closeControllers();
+    h.serverManager.dispose();
+  });
+
+  group('shuffled session start (#1811)', () {
+    final playlist = [for (var i = 0; i < 6; i++) _track('p$i')];
+
+    test('no start track shuffles the head too instead of pinning the first track', () async {
+      h.queueRandom.lowestDraw();
+
+      await h.playTracks(playlist, shuffle: true);
+
+      final opened = h.service.currentTrack!;
+      expect(opened.id, isNot('p0'), reason: 'shuffle opened on the list head');
+      expect(h.service.queue.first.id, opened.id);
+      expect(h.service.queue.map((t) => t.id).toSet(), playlist.map((t) => t.id).toSet());
+      expect(h.service.shuffled, isTrue);
+      expect(h.player.openedUris, [_urlFor(opened)]);
+    });
+
+    test('an explicit start track still anchors the shuffled queue', () async {
+      h.queueRandom.lowestDraw();
+
+      await h.playTracks(playlist, startTrack: playlist[3], shuffle: true);
+
+      expect(h.service.currentTrack!.id, 'p3');
+      expect(h.service.queue.first.id, 'p3');
+      expect(h.service.queue.map((t) => t.id).toSet(), playlist.map((t) => t.id).toSet());
+    });
+
+    test('a start track absent from the list drops the anchor rather than pinning the first track', () async {
+      h.queueRandom.lowestDraw();
+
+      await h.playTracks(playlist, startTrack: _track('not-in-list'), shuffle: true);
+
+      expect(h.service.currentTrack!.id, isNot('p0'));
+      expect(h.service.queue.map((t) => t.id).toSet(), playlist.map((t) => t.id).toSet());
+    });
   });
 
   test('volume updates notify only the dedicated volume listenable', () async {
@@ -687,6 +831,152 @@ void main() {
     expect(h.controls.metadataTitles, ['Track t1']);
   });
 
+  test('a superseded slow gapless resolve cannot overwrite the newly requested arm', () async {
+    final oldArmGate = h.resolver._gateNextResolve(t2.id);
+
+    await h.playTracks([t1, t2]);
+    await oldArmGate.entered;
+    expect(h.player.armed, isNull);
+
+    h.service.addNext([t3]);
+    oldArmGate.release();
+    await pumpEventQueue();
+
+    expect(h.player.armed?.uri, _urlFor(t3));
+  });
+
+  test('end-of-track sleep invalidates a slow gapless resolve', () async {
+    final armGate = h.resolver._gateNextResolve(t2.id);
+
+    await h.playTracks([t1, t2]);
+    await armGate.entered;
+    h.service.setSleepTimer(null, endOfTrack: true);
+    armGate.release();
+    await pumpEventQueue();
+
+    expect(h.service.sleepTimerEndOfTrack, isTrue);
+    expect(h.player.armed, isNull);
+  });
+
+  test('manual advance cancels a blocked arm until replacement open commits', () async {
+    final staleArmGate = h.resolver._gateNextResolve(t2.id);
+    final replacementResolveGate = h.resolver._gateNextResolve(t2.id);
+
+    await h.playTracks([t1, t2, t3]);
+    await staleArmGate.entered;
+
+    final replacementOpenGate = h.player._gateNextOpen();
+    final advance = h.service.next();
+    await replacementResolveGate.entered;
+    replacementResolveGate.release();
+    await replacementOpenGate.entered;
+
+    staleArmGate.release();
+    await pumpEventQueue();
+
+    expect(h.resolver.resolveCounts[t3.id], isNull);
+    expect(h.player.armed, isNull);
+    expect(h.player.openedUris, [_urlFor(t1)]);
+
+    replacementOpenGate.release();
+    await advance;
+    await pumpEventQueue();
+
+    expect(h.service.currentTrack?.id, t2.id);
+    expect(h.player.openedUris, [_urlFor(t1), _urlFor(t2)]);
+    expect(h.resolver.resolveCounts[t3.id], 1);
+    expect(h.player.armed?.uri, _urlFor(t3));
+
+    expect(h.player.emitNaturalBoundary(), isTrue);
+    await pumpEventQueue();
+
+    expect(h.service.currentTrack?.id, t3.id);
+    expect(h.service.currentIndex, 2);
+    expect(h.player.openedUris, [_urlFor(t1), _urlFor(t2)], reason: 'C must advance from the native arm');
+  });
+
+  test('queue edits during a replacement open coalesce into the latest post-open arm', () async {
+    final t4 = _track('t4');
+    final t5 = _track('t5');
+    await h.playTracks([t1, t2, t3]);
+
+    final replacementOpenGate = h.player._gateNextOpen();
+    final advance = h.service.next();
+    await replacementOpenGate.entered;
+    final latestArmGate = h.resolver._gateNextResolve(t5.id);
+
+    h.service.addNext([t4]);
+    h.service.addNext([t5]);
+    await pumpEventQueue();
+
+    expect(h.resolver.resolveCounts[t4.id], isNull);
+    expect(h.resolver.resolveCounts[t5.id], isNull);
+    expect(h.player.armed, isNull);
+
+    replacementOpenGate.release();
+    await advance;
+    await latestArmGate.entered;
+
+    expect(h.resolver.resolveCounts[t4.id], isNull);
+    expect(h.resolver.resolveCounts[t5.id], 1);
+    expect(h.player.armed, isNull);
+
+    latestArmGate.release();
+    await pumpEventQueue();
+
+    expect(h.service.queue.map((track) => track.id), [t1.id, t2.id, t5.id, t4.id, t3.id]);
+    expect(h.player.armed?.uri, _urlFor(t5));
+    expect(h.player.emitNaturalBoundary(), isTrue);
+    await pumpEventQueue();
+    expect(h.service.currentTrack?.id, t5.id);
+    expect(h.player.openedUris, [_urlFor(t1), _urlFor(t2)]);
+  });
+
+  test('completed fallback cancels a blocked arm until replacement open commits', () async {
+    final staleArmGate = h.resolver._gateNextResolve(t2.id);
+    final replacementResolveGate = h.resolver._gateNextResolve(t2.id);
+
+    await h.playTracks([t1, t2, t3]);
+    await staleArmGate.entered;
+    final replacementOpenGate = h.player._gateNextOpen();
+
+    h.player.emitCompleted();
+    await replacementResolveGate.entered;
+    replacementResolveGate.release();
+    await replacementOpenGate.entered;
+
+    staleArmGate.release();
+    await pumpEventQueue();
+
+    expect(h.resolver.resolveCounts[t3.id], isNull);
+    expect(h.player.armed, isNull);
+
+    replacementOpenGate.release();
+    await pumpEventQueue();
+
+    expect(h.service.currentTrack?.id, t2.id);
+    expect(h.player.openedUris, [_urlFor(t1), _urlFor(t2)]);
+    expect(h.player.armed?.uri, _urlFor(t3));
+    expect(h.player.emitNaturalBoundary(), isTrue);
+    await pumpEventQueue();
+    expect(h.service.currentTrack?.id, t3.id);
+    expect(h.player.openedUris, [_urlFor(t1), _urlFor(t2)]);
+  });
+
+  test('a slow instant mix cannot replace a newer explicit queue', () async {
+    final mixGate = Completer<List<MediaItem>>();
+    h.client.instantMixGate = mixGate;
+
+    final mix = h.service.playInstantMix(t1);
+    await h.playTracks([t3]);
+    mixGate.complete([t1, t2]);
+    await mix;
+    await pumpEventQueue();
+
+    expect(h.service.currentTrack?.id, t3.id);
+    expect(h.service.queue.map((track) => track.id), [t3.id]);
+  });
+
   test('trackTransition advances the cursor, re-arms, and reports the previous track stopped at duration', () async {
     await h.playTracks([t1, t2, t3]);
 
@@ -708,6 +998,69 @@ void main() {
     expect(h.client.markedWatched, ['t1']);
     // New session started for the new track.
     expect(h.client.reportsFor('started').map((r) => r.itemId), ['t1', 't2']);
+  });
+
+  test('a gaplessly advanced track reports its own start, not the finished track\'s playhead (#1849)', () async {
+    final long = testMediaItem(
+      id: 'long',
+      backend: MediaBackend.plex,
+      kind: MediaKind.track,
+      title: 'Long opener',
+      parentTitle: 'Album',
+      grandparentTitle: 'Artist',
+      durationMs: const Duration(minutes: 7).inMilliseconds,
+      serverId: 'srv',
+    );
+    await h.playTracks([long, t2]);
+
+    // When the advance is announced, the live player state still carries the
+    // finished track's playhead — the new file has not reported yet. Reporting
+    // that as the new track's first sample told Plex it was already at ~100%,
+    // which recorded a play (and a Last.fm scrobble) at track start on top of
+    // the real one (#1849).
+    h.player.setOutgoingPlayhead(position: const Duration(minutes: 7), duration: const Duration(minutes: 7));
+    h.player.emitTransition(_urlFor(t2));
+    await pumpEventQueue();
+
+    final started = h.client.reportsFor('started').toList();
+    expect(started.map((r) => r.itemId), ['long', 't2']);
+    expect(started.last.position, Duration.zero);
+    expect(started.last.duration, _trackDuration, reason: 'the initial report carries t2\'s own duration');
+    // The finished track is the only one whose watch settles; t2 must not be
+    // latched watched off the stale ~100% sample.
+    expect(h.client.markedWatched, ['long']);
+  });
+
+  test('a track with no metadata duration is reported stopped where the source actually got to', () async {
+    // Nothing supplies a duration to report at, so the outgoing position is the
+    // only truth — and by the time the transition is handled the player's live
+    // position already belongs to the track that replaced it.
+    final undated = testMediaItem(
+      id: 'nd',
+      backend: MediaBackend.plex,
+      kind: MediaKind.track,
+      title: 'Unknown length',
+      parentTitle: 'Album',
+      grandparentTitle: 'Artist',
+      serverId: 'srv',
+    );
+    await h.playTracks([undated, t2]);
+
+    // The gapless advance: the new source is at its start, and the player has
+    // recorded where the old one handed over.
+    h.player.outgoingSourcePosition = const Duration(minutes: 2, seconds: 12);
+    h.player.setPosition(Duration.zero);
+    h.player.emitTransition(_urlFor(t2));
+    await pumpEventQueue();
+
+    final stopped = h.client.reportsFor('stopped').toList();
+    expect(stopped, hasLength(1));
+    expect(stopped.single.itemId, 'nd');
+    expect(
+      stopped.single.position,
+      const Duration(minutes: 2, seconds: 12),
+      reason: 'the new source has reset the live position; the outgoing track played to 2:12',
+    );
   });
 
   test('completed with nothing armed parks paused at the end and keeps the track', () async {
@@ -876,6 +1229,52 @@ void main() {
     expect(h.client.reportsFor('stopped').map((r) => r.itemId), ['t1']);
   });
 
+  test('failed explicit resume does not publish playing status', () async {
+    await h.playTracks([t1]);
+    await h.service.pause();
+    final gate = Completer<void>();
+    final denied = StateError('audio focus denied');
+    h.player.playGate = gate;
+
+    final resume = h.service.play();
+    expect(h.service.status, MusicPlaybackStatus.paused);
+    final failureExpectation = expectLater(resume, throwsA(same(denied)));
+    gate.completeError(denied, StackTrace.current);
+    await failureExpectation;
+
+    expect(h.player.playCalls, 1);
+    expect(h.service.status, MusicPlaybackStatus.paused);
+  });
+
+  test('a late play completion cannot revive a stopped session', () async {
+    await h.playTracks([t1]);
+    await h.service.pause();
+    final gate = Completer<void>();
+    h.player.playGate = gate;
+
+    final play = h.service.play();
+    await h.service.stop();
+    gate.complete();
+    await play;
+
+    expect(h.service.status, MusicPlaybackStatus.idle);
+    expect(h.service.currentTrack, isNull);
+  });
+
+  test('a late pause completion cannot change a stopped session', () async {
+    await h.playTracks([t1]);
+    final gate = Completer<void>();
+    h.player.pauseGate = gate;
+
+    final pause = h.service.pause();
+    await h.service.stop();
+    gate.complete();
+    await pause;
+
+    expect(h.service.status, MusicPlaybackStatus.idle);
+    expect(h.service.currentTrack, isNull);
+  });
+
   test('interruption pauses and resumes when the system says shouldResume', () async {
     await h.playTracks([t1, t2]);
 
@@ -920,13 +1319,17 @@ void main() {
     expect(h.player.seeks.last, Duration.zero);
   });
 
-  test('music advertises stop and skip but never a speed control', () async {
+  test('music advertises play, pause, stop, and skip but never a speed control', () async {
     await h.playTracks([t1, t2]);
 
     expect(h.controls.controlSyncs, isNotEmpty);
     final last = h.controls.controlSyncs.last;
+    expect(last.canPlayPause, isTrue);
     expect(last.canStop, isTrue);
     expect(last.canSkip, isTrue);
+    // Music never claims the Darwin lock-screen side slots for skip —
+    // next/previous stay the primary transport there.
+    expect(last.preferSkipOverTrackButtons, isFalse);
     expect(last.canSetSpeed, isFalse);
   });
 
@@ -1085,5 +1488,47 @@ void main() {
     expect(h.service.status, MusicPlaybackStatus.paused);
     expect(h.service.currentTrack?.id, 't1');
     expect(h.service.sleepTimerActive, isFalse);
+  });
+
+  test('the service republishes the player playhead jumps the now-playing bar listens to', () async {
+    // OS media controls, a headset and the lock screen seek straight through
+    // the service, so this stream is the only way the now-playing seek bar can
+    // learn that its pending keyboard target was superseded (#1819). What the
+    // bar then does with a jump is covered in test/media/stepped_seek_test.dart.
+    await h.playTracks([t1]);
+
+    final jumps = <Duration?>[];
+    final subscription = h.service.playheadJumpStream.listen(jumps.add);
+    addTearDown(subscription.cancel);
+
+    h.player.playheadJumpCtrl.add(const Duration(minutes: 2));
+    h.player.playheadJumpCtrl.add(null);
+    await pumpEventQueue();
+
+    expect(jumps, [const Duration(minutes: 2), isNull]);
+  });
+
+  group('foreground hardware media keys (#1948)', () {
+    test('transport keys drive the live session and stop unregisters the handler', () async {
+      await h.playTracks([t1, t2]);
+
+      // Consumed and routed: next advances the queue.
+      expect(await simulateKeyDownEvent(LogicalKeyboardKey.mediaTrackNext, platform: 'android'), isTrue);
+      expect(await simulateKeyUpEvent(LogicalKeyboardKey.mediaTrackNext, platform: 'android'), isTrue);
+      await pumpEventQueue();
+      expect(h.service.currentTrack?.id, 't2');
+
+      // A directed pause reaches the player.
+      expect(await simulateKeyDownEvent(LogicalKeyboardKey.mediaPause, platform: 'android'), isTrue);
+      expect(await simulateKeyUpEvent(LogicalKeyboardKey.mediaPause, platform: 'android'), isTrue);
+      await pumpEventQueue();
+      expect(h.player.pauseCalls, 1);
+
+      // No session, no claim on the keys: back to normal dispatch.
+      await h.service.stop();
+      await pumpEventQueue();
+      expect(await simulateKeyDownEvent(LogicalKeyboardKey.mediaPlayPause, platform: 'android'), isFalse);
+      expect(await simulateKeyUpEvent(LogicalKeyboardKey.mediaPlayPause, platform: 'android'), isFalse);
+    });
   });
 }

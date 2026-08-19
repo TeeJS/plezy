@@ -1,6 +1,10 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+
+import '../../i18n/app_locale_utils.dart';
+import '../../i18n/strings.g.dart';
 
 import '../../models/seerr/seerr_details.dart';
 import '../../models/seerr/seerr_media.dart';
@@ -26,8 +30,7 @@ typedef SeerrPlexTokenSupplier = Future<String?> Function();
 /// On 401 it re-logins silently via [SeerrAuthService.reauth] (password
 /// methods use the stored secret; plex uses [plexTokenSupplier]), swaps the
 /// cookie, and retries once. Concurrent re-auths coalesce per instance+user
-/// so a burst of in-flight 401s triggers a single login POST — the same
-/// shape as `TraktClient._refreshesByToken`.
+/// so a burst of in-flight 401s triggers a single login POST.
 class SeerrClient {
   static final KeyedFutureCoalescer<String, SeerrSession> _reauthsByIdentity = KeyedFutureCoalescer();
 
@@ -65,6 +68,7 @@ class SeerrClient {
 
   // ---------- Auth ----------
 
+  @visibleForTesting
   Future<SeerrUser> getMe() async {
     final data = await _request('GET', '/auth/me');
     return SeerrUser.fromJson(data as Map<String, dynamic>);
@@ -84,10 +88,20 @@ class SeerrClient {
   // ---------- Discover / search ----------
 
   /// `/discover/movies` — popular movies.
-  Future<SeerrPage<SeerrMedia>> getPopularMovies({int page = 1}) => _mediaPage('/discover/movies', page, 'movie');
+  ///
+  /// Deliberately unlocalized. Overseerr and Jellyseerr bind this route's
+  /// `language` query parameter to `originalLanguage`, i.e. TMDB's
+  /// `with_original_language`, so sending the app locale narrows the shelf to
+  /// titles *originally made* in that language (#1763). The display language
+  /// here comes from the instance/user locale, which already wins over the
+  /// query value, so omitting it costs nothing.
+  Future<SeerrPage<SeerrMedia>> getPopularMovies({int page = 1}) =>
+      _mediaPage('/discover/movies', page, 'movie', localized: false);
 
-  /// `/discover/tv` — popular series.
-  Future<SeerrPage<SeerrMedia>> getPopularTv({int page = 1}) => _mediaPage('/discover/tv', page, 'tv');
+  /// `/discover/tv` — popular series. Unlocalized for the same reason as
+  /// [getPopularMovies].
+  Future<SeerrPage<SeerrMedia>> getPopularTv({int page = 1}) =>
+      _mediaPage('/discover/tv', page, 'tv', localized: false);
 
   Future<SeerrPage<SeerrMedia>> getUpcomingMovies({int page = 1}) =>
       _mediaPage('/discover/movies/upcoming', page, 'movie');
@@ -101,7 +115,7 @@ class SeerrClient {
   /// `/search` — Seerr's TMDB-backed catalog search (mixed results, person
   /// entries dropped).
   Future<SeerrPage<SeerrMedia>> search(String query, {int page = 1}) async {
-    final data = await _request('GET', '/search', query: {'query': query, 'page': page});
+    final data = await _request('GET', '/search', query: {'query': query, 'page': page, 'language': _language});
     return _parseMediaPage(data, null);
   }
 
@@ -113,8 +127,16 @@ class SeerrClient {
   Future<SeerrPage<SeerrMedia>> getTvRecommendations(int tmdbId, {int page = 1}) =>
       _mediaPage('/tv/$tmdbId/recommendations', page, 'tv');
 
-  Future<SeerrPage<SeerrMedia>> _mediaPage(String path, int page, String? coerceMediaType) async {
-    final data = await _request('GET', path, query: {'page': page});
+  /// [localized] adds the app locale as `language`. Only the two paged
+  /// discover routes opt out; everywhere else Seerr treats it as the display
+  /// language, which is what we want.
+  Future<SeerrPage<SeerrMedia>> _mediaPage(
+    String path,
+    int page,
+    String? coerceMediaType, {
+    bool localized = true,
+  }) async {
+    final data = await _request('GET', path, query: {'page': page, if (localized) 'language': _language});
     return _parseMediaPage(data, coerceMediaType);
   }
 
@@ -128,14 +150,13 @@ class SeerrClient {
 
   // ---------- Details ----------
 
-  Future<SeerrMovieDetails> getMovie(int tmdbId) async {
-    final data = await _request('GET', '/movie/$tmdbId');
-    return SeerrMovieDetails.fromJson(data as Map<String, dynamic>);
-  }
+  Future<SeerrDetails> getMovie(int tmdbId) => _details('/movie/$tmdbId');
 
-  Future<SeerrTvDetails> getTv(int tmdbId) async {
-    final data = await _request('GET', '/tv/$tmdbId');
-    return SeerrTvDetails.fromJson(data as Map<String, dynamic>);
+  Future<SeerrDetails> getTv(int tmdbId) => _details('/tv/$tmdbId');
+
+  Future<SeerrDetails> _details(String path) async {
+    final data = await _request('GET', path, query: {'language': _language});
+    return SeerrDetails.fromJson(data as Map<String, dynamic>);
   }
 
   // ---------- Requests ----------
@@ -143,10 +164,6 @@ class SeerrClient {
   Future<SeerrRequest> createRequest(SeerrRequestPayload payload) async {
     final data = await _request('POST', '/request', body: payload.toJson());
     return SeerrRequest.fromJson(data as Map<String, dynamic>);
-  }
-
-  Future<void> deleteRequest(int requestId) async {
-    await _request('DELETE', '/request/$requestId');
   }
 
   // ---------- Sonarr / Radarr options (request sheet advanced pickers) ----------
@@ -174,6 +191,7 @@ class SeerrClient {
   }
 
   // ---------- Internals ----------
+  String get _language => LocaleSettings.currentLocale.plexLanguageCode;
 
   Future<dynamic> _request(
     String method,
@@ -192,7 +210,11 @@ class SeerrClient {
       res = await _http.send(method, path, query: query, body: body);
       if (res.statusCode == 401) {
         onSessionInvalidated();
-        throw const SeerrAuthException('Session rejected after successful re-auth', statusCode: 401);
+        throw SeerrAuthException(
+          'Session rejected after successful re-auth',
+          statusCode: 401,
+          display: t.seerr.sessionRejectedAfterReauth,
+        );
       }
     }
     SeerrHttpClient.throwForStatus(res);

@@ -54,6 +54,20 @@ final class _LibraryItemRow extends _LibraryNavRow {
   const _LibraryItemRow({required super.section, required this.library, this.showServerName = false});
 }
 
+/// SELECT activates the rail row, RIGHT hands off to the content area.
+KeyEventResult _handleRailItemKey(KeyEvent event, {required VoidCallback onSelect, VoidCallback? onNavigateRight}) {
+  if (event is! KeyDownEvent) return KeyEventResult.ignored;
+  if (event.logicalKey.isSelectKey) {
+    onSelect();
+    return KeyEventResult.handled;
+  }
+  if (event.logicalKey == LogicalKeyboardKey.arrowRight && onNavigateRight != null) {
+    onNavigateRight();
+    return KeyEventResult.handled;
+  }
+  return KeyEventResult.ignored;
+}
+
 /// Reusable navigation rail item widget that handles focus, selection, and interaction
 class NavigationRailItem extends StatelessWidget {
   final IconData icon;
@@ -63,6 +77,9 @@ class NavigationRailItem extends StatelessWidget {
   /// Playing item's equalizer). Should be at most [iconSize] tall/wide.
   final Widget? iconWidget;
   final Widget label;
+
+  /// Widget rendered after the [label] (e.g. a section header's chevron).
+  final Widget? trailing;
   final bool isSelected;
   final bool isCollapsed;
   final bool useSimpleLayout;
@@ -74,6 +91,11 @@ class NavigationRailItem extends StatelessWidget {
   final double horizontalPadding;
   final bool suppressSelectedBackground;
 
+  /// Background tint while keyboard-focused, and its stronger variant used
+  /// when the item also shows its selected background.
+  final double focusAlpha;
+  final double selectedFocusAlpha;
+
   /// Called when RIGHT arrow is pressed to navigate to content area.
   final VoidCallback? onNavigateRight;
 
@@ -83,6 +105,7 @@ class NavigationRailItem extends StatelessWidget {
     this.selectedIcon,
     this.iconWidget,
     required this.label,
+    this.trailing,
     required this.isSelected,
     this.isCollapsed = false,
     this.useSimpleLayout = false,
@@ -93,6 +116,8 @@ class NavigationRailItem extends StatelessWidget {
     this.iconSize = 22,
     this.horizontalPadding = 17,
     this.suppressSelectedBackground = false,
+    this.focusAlpha = 0.12,
+    this.selectedFocusAlpha = 0.15,
     this.onNavigateRight,
   });
 
@@ -108,18 +133,7 @@ class NavigationRailItem extends StatelessWidget {
         return Focus(
           focusNode: focusNode,
           autofocus: autofocus,
-          onKeyEvent: (node, event) {
-            if (event is! KeyDownEvent) return KeyEventResult.ignored;
-            if (event.logicalKey.isSelectKey) {
-              onTap();
-              return KeyEventResult.handled;
-            }
-            if (event.logicalKey == LogicalKeyboardKey.arrowRight && onNavigateRight != null) {
-              onNavigateRight!();
-              return KeyEventResult.handled;
-            }
-            return KeyEventResult.ignored;
-          },
+          onKeyEvent: (node, event) => _handleRailItemKey(event, onSelect: onTap, onNavigateRight: onNavigateRight),
           child: Material(
             color: Colors.transparent,
             child: InkWell(
@@ -129,8 +143,10 @@ class NavigationRailItem extends StatelessWidget {
               child: Container(
                 decoration: BoxDecoration(
                   color: () {
-                    if (isCollapsed) return focused ? t.text.withValues(alpha: 0.12) : null;
-                    if (focused) return t.text.withValues(alpha: showSelectedBackground ? 0.15 : 0.12);
+                    if (isCollapsed) return focused ? t.text.withValues(alpha: focusAlpha) : null;
+                    if (focused) {
+                      return t.text.withValues(alpha: showSelectedBackground ? selectedFocusAlpha : focusAlpha);
+                    }
                     if (showSelectedBackground) return t.text.withValues(alpha: 0.1);
                     return null;
                   }(),
@@ -162,6 +178,7 @@ class NavigationRailItem extends StatelessWidget {
                               return AnimatedOpacity(opacity: opacity, duration: t.fast, child: label);
                             }(),
                           ),
+                          ?trailing,
                         ],
                       ),
                     ),
@@ -220,7 +237,10 @@ class SideNavigationRail extends StatefulWidget {
 }
 
 class SideNavigationRailState extends State<SideNavigationRail> with MountedSetStateMixin {
-  bool _librariesExpanded = true;
+  /// Libraries section expansion, held in settings rather than widget state so
+  /// it survives relaunch, remount and layout switches (#1896). The rail's
+  /// [ListenableBuilder] below listens to the pref, so the toggle just writes.
+  bool get _librariesExpanded => SettingsService.instance.read(SettingsService.librariesSectionExpanded);
 
   bool _isHovered = false;
   bool _isTouchExpanded = false;
@@ -644,7 +664,7 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
     final hasLiveTv = context.watch<MultiServerProvider>().hasLiveTv;
     // Nullable watch: rail tests (and any host without the profile session
     // scope) simply never show the Explore item.
-    final hasExplore = context.watch<CatalogSourcesProvider?>()?.hasAnySource ?? false;
+    final hasExploreSource = context.watch<CatalogSourcesProvider?>()?.hasAnySource ?? false;
     // Nullable watch: rail tests (and any host without the profile session
     // scope) simply never show the Now Playing item. TV-only — it is the
     // way back into the now-playing screen there; desktop already has the
@@ -652,14 +672,18 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
     final musicService = context.watch<MusicPlaybackService?>();
     final nowPlayingTrack = widget.isOfflineMode || !PlatformDetector.isTV() ? null : musicService?.currentTrack;
 
-    // Listen to fullscreen + groupLibrariesByServer setting so the rail
-    // rebuilds when the user toggles "Group libraries by server" in Appearance.
+    // Listen to fullscreen + the groupLibrariesByServer / showExploreTab
+    // settings so the rail rebuilds when they are toggled in Appearance, and to
+    // librariesSectionExpanded so the Libraries header toggle repaints.
     return ListenableBuilder(
       listenable: Listenable.merge([
         FullscreenStateManager(),
         SettingsService.instance.listenable(SettingsService.groupLibrariesByServer),
+        SettingsService.instance.listenable(SettingsService.showExploreTab),
+        SettingsService.instance.listenable(SettingsService.librariesSectionExpanded),
       ]),
       builder: (context, _) {
+        final hasExplore = hasExploreSource && SettingsService.instance.read(SettingsService.showExploreTab);
         // Server grouping: only when multi-server AND the user-facing toggle is on.
         final groupByServerSetting = SettingsService.instance.read(SettingsService.groupLibrariesByServer);
         final showServerHeaders = serverIds.length > 1 && groupByServerSetting;
@@ -996,107 +1020,45 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
   }) {
     final librariesProvider = context.watch<LibrariesProvider>();
     final isLoading = librariesProvider.isLoading;
-    final isLibrariesSelected = widget.selectedTab == NavigationTabId.libraries && widget.selectedLibraryKey == null;
-    final librariesFocusNode = _focusTracker.get(_kLibraries);
-    final showLibrariesSelectedBackground = isLibrariesSelected && !widget.isSidebarFocused;
+    final isLibrariesTabSelected = widget.selectedTab == NavigationTabId.libraries;
     final allEmpty = visibleRows.isEmpty && hiddenLibraryCount == 0;
 
     return Column(
       crossAxisAlignment: .start,
       children: [
-        ListenableBuilder(
-          listenable: librariesFocusNode,
-          builder: (context, _) => Focus(
-            focusNode: librariesFocusNode,
-            onKeyEvent: (node, event) {
-              if (event is! KeyDownEvent) return KeyEventResult.ignored;
-              if (event.logicalKey.isSelectKey) {
-                setState(() {
-                  _librariesExpanded = !_librariesExpanded;
-                });
-                return KeyEventResult.handled;
-              }
-              // RIGHT arrow navigates to content area
-              if (event.logicalKey == LogicalKeyboardKey.arrowRight && widget.onNavigateToContent != null) {
-                widget.onNavigateToContent!();
-                return KeyEventResult.handled;
-              }
-              return KeyEventResult.ignored;
-            },
-            child: Material(
-              color: Colors.transparent,
-              child: InkWell(
-                canRequestFocus: false,
-                onTap: () {
-                  setState(() {
-                    _librariesExpanded = !_librariesExpanded;
-                  });
-                },
-                borderRadius: BorderRadius.circular(tokens(context).radiusMd),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: () {
-                      final showFocus = librariesFocusNode.hasFocus && InputModeTracker.isKeyboardMode(context);
-                      if (isCollapsed) return showFocus ? t.text.withValues(alpha: 0.08) : null;
-                      if (showLibrariesSelectedBackground) return t.text.withValues(alpha: 0.1);
-                      if (showFocus) return t.text.withValues(alpha: 0.08);
-                      return null;
-                    }(),
-                    borderRadius: BorderRadius.circular(tokens(context).radiusMd),
-                  ),
-                  clipBehavior: Clip.hardEdge,
-                  child: UnconstrainedBox(
-                    alignment: .centerLeft,
-                    constrainedAxis: Axis.vertical,
-                    clipBehavior: Clip.hardEdge,
-                    child: SizedBox(
-                      width: expandedWidth - 24,
-                      child: Padding(
-                        padding: .symmetric(vertical: 12, horizontal: itemHorizontalPadding),
-                        child: Row(
-                          children: [
-                            AppIcon(
-                              Symbols.video_library_rounded,
-                              fill: 1,
-                              size: 22,
-                              color: widget.selectedTab == NavigationTabId.libraries ? t.text : t.textMuted,
-                            ),
-                            const SizedBox(width: 11),
-                            Expanded(
-                              child: AnimatedOpacity(
-                                opacity: isCollapsed ? 0.0 : 1.0,
-                                duration: tokens(context).fast,
-                                child: Text(
-                                  Translations.of(context).navigation.libraries,
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: widget.selectedTab == NavigationTabId.libraries
-                                        ? FontWeight.w600
-                                        : FontWeight.w400,
-                                    color: widget.selectedTab == NavigationTabId.libraries ? t.text : t.textMuted,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            AnimatedOpacity(
-                              opacity: isCollapsed ? 0.0 : 1.0,
-                              duration: tokens(context).fast,
-                              child: AppIcon(
-                                _librariesExpanded ? Symbols.expand_less_rounded : Symbols.expand_more_rounded,
-                                fill: 1,
-                                size: 20,
-                                color: t.textMuted,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
+        NavigationRailItem(
+          icon: Symbols.video_library_rounded,
+          label: Text(
+            Translations.of(context).navigation.libraries,
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: isLibrariesTabSelected ? FontWeight.w600 : FontWeight.w400,
+              color: isLibrariesTabSelected ? t.text : t.textMuted,
             ),
           ),
+          trailing: AnimatedOpacity(
+            opacity: isCollapsed ? 0.0 : 1.0,
+            duration: tokens(context).fast,
+            child: AppIcon(
+              _librariesExpanded ? Symbols.expand_less_rounded : Symbols.expand_more_rounded,
+              fill: 1,
+              size: 20,
+              color: t.textMuted,
+            ),
+          ),
+          isSelected: isLibrariesTabSelected,
+          isCollapsed: isCollapsed,
+          onTap: () =>
+              unawaited(SettingsService.instance.write(SettingsService.librariesSectionExpanded, !_librariesExpanded)),
+          focusNode: _focusTracker.get(_kLibraries),
+          borderRadius: BorderRadius.circular(tokens(context).radiusMd),
+          horizontalPadding: itemHorizontalPadding,
+          // A selected library owns the highlight; the header only shows it
+          // for the bare Libraries tab.
+          suppressSelectedBackground: widget.isSidebarFocused || widget.selectedLibraryKey != null,
+          focusAlpha: 0.08,
+          selectedFocusAlpha: 0.1,
+          onNavigateRight: widget.onNavigateToContent,
         ),
 
         TweenAnimationBuilder<double>(
@@ -1243,18 +1205,8 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
         listenable: focusNode,
         builder: (context, _) => Focus(
           focusNode: focusNode,
-          onKeyEvent: (node, event) {
-            if (event is! KeyDownEvent) return KeyEventResult.ignored;
-            if (event.logicalKey.isSelectKey) {
-              onToggle();
-              return KeyEventResult.handled;
-            }
-            if (event.logicalKey == LogicalKeyboardKey.arrowRight && widget.onNavigateToContent != null) {
-              widget.onNavigateToContent!();
-              return KeyEventResult.handled;
-            }
-            return KeyEventResult.ignored;
-          },
+          onKeyEvent: (node, event) =>
+              _handleRailItemKey(event, onSelect: onToggle, onNavigateRight: widget.onNavigateToContent),
           child: Material(
             color: Colors.transparent,
             child: InkWell(

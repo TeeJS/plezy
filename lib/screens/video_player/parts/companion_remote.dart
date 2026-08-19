@@ -14,39 +14,17 @@ extension _VideoPlayerCompanionRemoteMethods on VideoPlayerScreenState {
     receiver.onPreviousTrack = () {
       if (mounted) unawaited(_restartOrPlayPrevious());
     };
-    receiver.onSeekForward = () async {
-      final settings = await SettingsService.getInstance();
-      await _seekRelative(Duration(seconds: settings.read(SettingsService.seekTimeSmall)));
+    receiver.onSeekForward = () => _dispatchCompanionSeek(1);
+    receiver.onSeekBackward = () => _dispatchCompanionSeek(-1);
+    receiver.onVolumeUp = () => _dispatchCompanionVolume(10);
+    receiver.onVolumeDown = () => _dispatchCompanionVolume(-10);
+    receiver.onVolumeMute = _dispatchCompanionMute;
+    receiver.onSubtitles = () {
+      if (_canControlPlayback()) _cycleSubtitleTrack();
     };
-    receiver.onSeekBackward = () async {
-      final settings = await SettingsService.getInstance();
-      await _seekRelative(Duration(seconds: -settings.read(SettingsService.seekTimeSmall)));
+    receiver.onAudioTracks = () {
+      if (_canControlPlayback()) _cycleAudioTrack();
     };
-    receiver.onVolumeUp = () async {
-      if (player == null) return;
-      final settings = await SettingsService.getInstance();
-      final maxVol = settings.read(SettingsService.maxVolume).toDouble();
-      final newVolume = (player!.state.volume + 10).clamp(0.0, maxVol);
-      unawaited(player!.setVolume(newVolume));
-      unawaited(settings.write(SettingsService.volume, newVolume));
-    };
-    receiver.onVolumeDown = () async {
-      if (player == null) return;
-      final settings = await SettingsService.getInstance();
-      final maxVol = settings.read(SettingsService.maxVolume).toDouble();
-      final newVolume = (player!.state.volume - 10).clamp(0.0, maxVol);
-      unawaited(player!.setVolume(newVolume));
-      unawaited(settings.write(SettingsService.volume, newVolume));
-    };
-    receiver.onVolumeMute = () async {
-      if (player == null) return;
-      final settings = await SettingsService.getInstance();
-      final transition = settings.resolveMuteToggle(player!.state.volume);
-      unawaited(player!.setVolume(transition.playerVolume));
-      unawaited(settings.write(SettingsService.volume, transition.persistedVolume));
-    };
-    receiver.onSubtitles = _cycleSubtitleTrack;
-    receiver.onAudioTracks = _cycleAudioTrack;
     receiver.onFullscreen = _toggleFullscreen;
 
     // Override home to exit the player first. Replacements inherit the base
@@ -63,6 +41,38 @@ extension _VideoPlayerCompanionRemoteMethods on VideoPlayerScreenState {
     } catch (e) {
       appLogger.d('CompanionRemote provider unavailable', error: e);
     }
+  }
+
+  void _dispatchCompanionSeek(int direction) {
+    final currentPlayer = player;
+    if (!mounted || currentPlayer == null || !_canControlPlayback()) return;
+    final settings = SettingsService.instance;
+    final seconds = settings.read(SettingsService.seekTimeSmall) * direction;
+    // _seekRelative captures the current player synchronously before its first
+    // await, binding this command to the exact screen/player owner at receipt.
+    unawaited(
+      _seekRelative(Duration(seconds: seconds)).catchError((Object error, StackTrace stackTrace) {
+        appLogger.w('Companion seek failed', error: error, stackTrace: stackTrace);
+      }),
+    );
+  }
+
+  void _dispatchCompanionVolume(double delta) {
+    final currentPlayer = player;
+    final controller = _volumeController;
+    if (!mounted || currentPlayer == null || controller == null || !controller.ownsPlayer(currentPlayer)) {
+      return;
+    }
+    controller.adjust(delta);
+  }
+
+  void _dispatchCompanionMute() {
+    final currentPlayer = player;
+    final controller = _volumeController;
+    if (!mounted || currentPlayer == null || controller == null || !controller.ownsPlayer(currentPlayer)) {
+      return;
+    }
+    controller.toggleMute();
   }
 
   void _cleanupCompanionRemoteCallbacks() {
@@ -92,7 +102,62 @@ extension _VideoPlayerCompanionRemoteMethods on VideoPlayerScreenState {
     _companionRemoteProvider = null;
   }
 
-  void _cycleSubtitleTrack() => _trackManager?.cycleSubtitleTrack();
+  void _cycleSubtitleTrack() {
+    final sourceTracks = _sourceSubtitleTracksForControls();
+    if (!_isOfflinePlayback && sourceTracks.isNotEmpty) {
+      _pendingSubtitleCycleCount++;
+      if (!_subtitleCycleDrainActive) unawaited(_drainSubtitleCycles());
+      return;
+    }
+    _cycleSubtitleTrackNatively();
+  }
+
+  /// Cycle through the native track list, for playback with no source
+  /// catalog to advance through (downloads, and items whose server exposes no
+  /// subtitle rows).
+  ///
+  /// The manager owns the selection and the server write-back; the committed
+  /// choice is this screen's, and the episode carry-over reads it, so a cycle
+  /// that lands on Off has to be recorded here or the next episode inherits
+  /// the choice this one started with.
+  void _cycleSubtitleTrackNatively() {
+    final cycled = _trackManager?.cycleSubtitleTrack();
+    if (cycled != null) _rememberNativeSubtitleSelection(cycled);
+  }
+
+  Future<void> _drainSubtitleCycles() async {
+    if (_subtitleCycleDrainActive) return;
+    _subtitleCycleDrainActive = true;
+    try {
+      while (mounted && _pendingSubtitleCycleCount > 0) {
+        await _waitForPlaybackTransitionIdle();
+        if (!mounted || _pendingSubtitleCycleCount == 0) break;
+
+        // Collapse every press queued before this dispatch into one target.
+        // Presses arriving during the reopen remain queued for the next pass.
+        final advances = _pendingSubtitleCycleCount;
+        final sourceTracks = _sourceSubtitleTracksForControls();
+        if (_isOfflinePlayback || sourceTracks.isEmpty) {
+          _pendingSubtitleCycleCount -= advances;
+          for (var i = 0; i < advances; i++) {
+            _cycleSubtitleTrackNatively();
+          }
+          continue;
+        }
+        final currentChoice =
+            _selectedSourceSubtitleChoiceForControls(sourceTracks) ?? const PlaybackSourceSubtitleChoice.off();
+        final targetChoice = PlaybackSubtitleResolver.advanceSourceChoice(sourceTracks, currentChoice, advances);
+        final outcome = await _switchPlaybackSource(newSubtitleChoice: targetChoice);
+        if (outcome == PlaybackSourceChangeOutcome.busy) {
+          await _waitForPlaybackTransitionIdle();
+          continue;
+        }
+        _pendingSubtitleCycleCount -= advances;
+      }
+    } finally {
+      _subtitleCycleDrainActive = false;
+    }
+  }
 
   void _cycleAudioTrack() => _trackManager?.cycleAudioTrack();
 

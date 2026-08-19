@@ -82,10 +82,17 @@ class _MobileRemoteScreenState extends State<MobileRemoteScreen> {
                     Row(
                       mainAxisAlignment: .center,
                       children: [
-                        OutlinedButton(onPressed: () => provider.cancelReconnect(), child: Text(t.common.cancel)),
+                        OutlinedButton(
+                          onPressed: () async {
+                            await provider.cancelReconnect();
+                          },
+                          child: Text(t.common.cancel),
+                        ),
                         const SizedBox(width: 16),
                         FilledButton(
-                          onPressed: () => provider.retryReconnectNow(),
+                          onPressed: () async {
+                            await provider.retryReconnectNow();
+                          },
                           child: Text(t.companionRemote.remote.retryNow),
                         ),
                       ],
@@ -196,7 +203,7 @@ class _RemoteControlContentState extends State<_RemoteControlContent> {
         ),
         Expanded(
           child: ListView(
-            padding: const EdgeInsets.all(16),
+            padding: .fromLTRB(16, 16, 16, 16 + MediaQuery.paddingOf(context).bottom),
             children: [
               SegmentedButton<int>(
                 showSelectedIcon: false,

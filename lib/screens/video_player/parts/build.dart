@@ -42,31 +42,57 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
       _lastVideoLayoutSize = pendingSize;
       _lastVideoLayoutPlayer = currentPlayer;
       _videoFilterManager?.updatePlayerSize(pendingSize);
-      _videoPIPManager?.updatePlayerSize(pendingSize);
       _updateAmbientLightingOnResize(pendingSize);
       unawaited(currentPlayer.updateFrame());
     });
   }
 
-  int? _selectedSourceSubtitleStreamIdForControls(List<MediaSubtitleTrack> tracks) {
+  PlaybackSourceSubtitleChoice? _selectedSourceSubtitleChoiceForControls(List<MediaSubtitleTrack> tracks) {
     if (tracks.isEmpty) return null;
-    for (final track in tracks) {
-      if (track.selected) return track.id;
+    if (widget.isLive) {
+      // Live selection is owned by the session state, not a PlaybackSession;
+      // tune metadata may carry stale server-side `selected` flags, so the
+      // fallback loop below must not run for live.
+      final selected = _live.selectedSubtitle;
+      return selected == null
+          ? const PlaybackSourceSubtitleChoice.off()
+          : PlaybackSourceSubtitleChoice.source(selected.id);
     }
-    return 0;
+    final selection = _playbackSession?.subtitleSelection;
+    if (selection != null) {
+      if (selection.isOff) return const PlaybackSourceSubtitleChoice.off();
+      final sourceId = selection.primarySourceStreamId;
+      if (sourceId != null && tracks.any((track) => track.id == sourceId)) {
+        return PlaybackSourceSubtitleChoice.source(sourceId);
+      }
+    }
+    for (final track in tracks) {
+      if (track.selected) return PlaybackSourceSubtitleChoice.source(track.id);
+    }
+    return const PlaybackSourceSubtitleChoice.off();
   }
 
+  List<PlaybackSubtitleSidecar> _sourceSubtitleSidecarsForControls() =>
+      _playbackSession?.context.result.subtitleSidecars ?? const <PlaybackSubtitleSidecar>[];
+
   List<MediaSubtitleTrack> _sourceSubtitleTracksForControls() {
+    if (widget.isLive) {
+      // The live session lists only server-deliverable (burnable) streams;
+      // in-band captions stay in the native player track list.
+      return _live.session?.subtitleTracks ?? const <MediaSubtitleTrack>[];
+    }
+    final sidecarSourceIds = {for (final sidecar in _sourceSubtitleSidecarsForControls()) ?sidecar.sourceStreamId};
     return selectableSourceSubtitleTracks(
       _currentMediaInfo?.subtitleTracks ?? const <MediaSubtitleTrack>[],
       isTranscoding: _isTranscoding,
+      sidecarSourceIds: sidecarSourceIds,
     );
   }
 
   Widget _buildLoadingSpinner() {
     return const Scaffold(
       backgroundColor: Colors.black,
-      body: Center(child: CircularProgressIndicator(color: Colors.white)),
+      body: Center(child: PlayerLoadingIndicator()),
     );
   }
 
@@ -94,29 +120,8 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
                   children: [
                     FocusableButton(
                       autofocus: true,
-                      onPressed: () {
-                        final playerToDispose = player;
-                        player = null;
-                        if (playerToDispose != null) unawaited(playerToDispose.dispose());
-                        _setPlayerState(() {
-                          _playerInitializationError = null;
-                          _isPlayerInitialized = false;
-                        });
-                        unawaited(_initializePlayer());
-                      },
-                      child: FilledButton(
-                        onPressed: () {
-                          final playerToDispose = player;
-                          player = null;
-                          if (playerToDispose != null) unawaited(playerToDispose.dispose());
-                          _setPlayerState(() {
-                            _playerInitializationError = null;
-                            _isPlayerInitialized = false;
-                          });
-                          unawaited(_initializePlayer());
-                        },
-                        child: Text(t.common.retry),
-                      ),
+                      onPressed: _retryPlayerInitialization,
+                      child: FilledButton(onPressed: _retryPlayerInitialization, child: Text(t.common.retry)),
                     ),
                     const SizedBox(width: 12),
                     FocusableButton(
@@ -177,7 +182,11 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
           final startZoom = _pinchStartZoomScale;
           final filterManager = _videoFilterManager;
           if (!_isPinchZooming || startZoom == null || filterManager == null) return;
-          final nextZoomScale = VideoFilterManager.normalizeZoomScale(startZoom * details.scale);
+          // Snap through 100% so pinching back undoes a zoom exactly, which is
+          // the touch path to an unzoomed picture (#1505).
+          final nextZoomScale = VideoFilterManager.normalizeZoomScale(
+            VideoFilterManager.snapPinchZoomScale(startZoom * details.scale),
+          );
 
           if (!_pinchZoomChanged) {
             if ((details.scale - 1.0).abs() <= _pinchZoomActivationThreshold) {
@@ -222,21 +231,34 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
                     final newSize = Size(constraints.maxWidth, constraints.maxHeight);
                     _scheduleVideoLayoutUpdate(newSize);
 
-                    // Compute canControl from Watch Together provider (reactive)
-                    bool canControl = true;
+                    var authority = (canControlPlayback: true, canNavigateMediaItems: true);
                     try {
-                      canControl = context.select<WatchTogetherProvider, bool>(
-                        (wt) => wt.isInSession ? wt.canControl() : true,
-                      );
-                    } catch (e) {
-                      // Watch Together not available, default to can control
+                      authority = context
+                          .select<WatchTogetherProvider, ({bool canControlPlayback, bool canNavigateMediaItems})>(
+                            (wt) => (
+                              canControlPlayback: !wt.isInSession || wt.canControl(),
+                              canNavigateMediaItems: !wt.isInSession || wt.isHost,
+                            ),
+                          );
+                    } catch (_) {
+                      // Watch Together is optional outside the main app shell.
+                    }
+                    if (_lastMediaControlAuthority != authority) {
+                      _lastMediaControlAuthority = authority;
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted) unawaited(_syncMediaControlsAvailability());
+                      });
                     }
 
                     VoidCallback? onNext;
                     if (widget.isLive) {
                       onNext = _hasNextChannel ? () => _switchLiveChannel(1) : null;
                     } else {
-                      onNext = (_nextEpisode != null && _canNavigateEpisodes()) ? _playNext : null;
+                      // _playNext no-ops while a navigation is in flight; matching that here
+                      // keeps the control from looking live while it does nothing.
+                      onNext = (_nextEpisode != null && !_isLoadingNext && authority.canNavigateMediaItems)
+                          ? _playNext
+                          : null;
                     }
 
                     VoidCallback? onPrevious;
@@ -244,10 +266,13 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
                       onPrevious = _hasPreviousChannel ? () => _switchLiveChannel(-1) : null;
                     } else {
                       final canRestartOrPrevious = _currentMetadata.isEpisode || _previousEpisode != null;
-                      onPrevious = (canRestartOrPrevious && _canNavigateEpisodes()) ? _restartOrPlayPrevious : null;
+                      onPrevious = (canRestartOrPrevious && authority.canNavigateMediaItems)
+                          ? _restartOrPlayPrevious
+                          : null;
                     }
 
                     final sourceAudioTracks = _currentMediaInfo?.audioTracks ?? const <MediaAudioTrack>[];
+                    final sourceSubtitleSidecars = _sourceSubtitleSidecarsForControls();
                     final sourceSubtitleTracks = _sourceSubtitleTracksForControls();
 
                     return Video(
@@ -255,6 +280,7 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
                       hasFirstFrame: _hasFirstFrame,
                       controls: (context) => PlexVideoControls(
                         player: player!,
+                        volumeController: _volumeController!,
                         metadata: _currentMetadata,
                         onNext: onNext,
                         onPrevious: onPrevious,
@@ -267,7 +293,9 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
                         sourceAudioTracks: sourceAudioTracks,
                         selectedAudioStreamId: _selectedAudioStreamId,
                         sourceSubtitleTracks: sourceSubtitleTracks,
-                        selectedSubtitleStreamId: _selectedSourceSubtitleStreamIdForControls(sourceSubtitleTracks),
+                        selectedSubtitleChoice: _selectedSourceSubtitleChoiceForControls(sourceSubtitleTracks),
+                        selectedSecondarySubtitleStreamId: _playbackSession?.subtitleSelection.secondarySourceStreamId,
+                        sourceSubtitleSidecars: sourceSubtitleSidecars,
                         sourcePartId: _currentMediaInfo?.partId,
                         onPlaybackSourceChanged: _switchPlaybackSource,
                         onTogglePIPMode: _togglePIPMode,
@@ -284,12 +312,13 @@ extension _VideoPlayerBuildMethods on VideoPlayerScreenState {
                         onSubtitleTrackChanged: _onSubtitleTrackChanged,
                         onSecondarySubtitleTrackChanged: _onSecondarySubtitleTrackChanged,
                         onSeekRequested: _seekPlayback,
-                        onPlayPauseRequested: () => _playOrPauseWithPlaybackIntent(player!),
+                        onPlayPauseRequested: _handleControlsTransport,
                         onSeekCompleted: _notifyWatchTogetherSeek,
                         onBack: _handleBackButton,
                         onReachedEnd: ({skipAutoPlayCountdown = false}) =>
                             _onVideoCompleted(true, skipAutoPlayCountdown: skipAutoPlayCountdown),
-                        canControl: canControl,
+                        canControl: authority.canControlPlayback,
+                        canNavigateMediaItems: authority.canNavigateMediaItems,
                         hasFirstFrame: _hasFirstFrame,
                         playNextFocusNode: _showPlayNextDialog ? _playNextConfirmFocusNode : null,
                         chromeController: _chromeController,

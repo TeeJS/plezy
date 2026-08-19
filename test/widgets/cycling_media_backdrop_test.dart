@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -5,8 +6,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:plezy/media/media_item.dart';
 import 'package:plezy/media/media_kind.dart';
+import 'package:plezy/services/settings_service.dart';
+import 'package:plezy/utils/media_image_helper.dart';
 import 'package:plezy/widgets/cycling_media_backdrop.dart';
 import 'package:plezy/widgets/tv_spotlight_background.dart';
+
+import '../test_helpers/prefs.dart';
 
 const _png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 const _rotationInterval = Duration(seconds: 1);
@@ -19,7 +24,10 @@ void main() {
   late File third;
   late Map<String, MemoryImage> imageProviders;
 
-  setUp(() {
+  setUp(() async {
+    // TvSpotlightBackground reads the corner-backdrop pref during build.
+    resetSharedPreferencesForTest();
+    await SettingsService.getInstance();
     directory = Directory.systemTemp.createTempSync('plezy-backdrop-cycle');
     final bytes = base64Decode(_png);
     first = File('${directory.path}/first.png')..writeAsBytesSync(bytes);
@@ -55,7 +63,6 @@ void main() {
               mediaKey: mediaKey,
               imagePaths: paths,
               client: null,
-              localArtworkPathResolver: (path) => path,
               imageProviderResolver: (path) => imageProviders[path],
               allowNetwork: false,
               active: active,
@@ -65,6 +72,48 @@ void main() {
               rotationInterval: _rotationInterval,
               fadeDuration: _fadeDuration,
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget buildAsyncBackdrop(
+    List<String> paths, {
+    required Future<bool> Function(File file) fileExists,
+    Object? mediaKey = 'movie-1',
+    List<String> fallbackPaths = const [],
+  }) {
+    final (memWidth, memHeight) = MediaImageHelper.getMemCacheDimensions(
+      displayWidth: 320,
+      displayHeight: 180,
+      imageType: ImageType.art,
+    );
+    return MaterialApp(
+      home: MediaQuery(
+        data: const MediaQueryData(size: Size(320, 180), devicePixelRatio: 1),
+        child: SizedBox(
+          width: 320,
+          height: 180,
+          child: CyclingMediaBackdrop(
+            mediaKey: mediaKey,
+            imagePaths: paths,
+            fallbackImagePaths: fallbackPaths,
+            client: null,
+            localArtworkPathResolver: (path) => path,
+            imageProviderResolver: (path) {
+              final provider = imageProviders[path];
+              return provider == null
+                  ? null
+                  : MediaImageHelper.boundedDecode(provider, memWidth: memWidth, memHeight: memHeight);
+            },
+            localFileExists: fileExists,
+            allowNetwork: false,
+            width: 320,
+            height: 180,
+            fallbackColor: Colors.black,
+            rotationInterval: _rotationInterval,
+            fadeDuration: _fadeDuration,
           ),
         ),
       ),
@@ -92,9 +141,35 @@ void main() {
   }
 
   Future<void> finishImageTransition(WidgetTester tester, {Duration fadeDuration = _fadeDuration}) async {
-    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 200)));
+    final incoming = find.byType(Image).last;
+    final image = tester.widget<Image>(incoming);
+    var source = image.image;
+    while (source is ResizeImage) {
+      source = source.imageProvider;
+    }
+    if (source is MemoryImage) {
+      final configuration = createLocalImageConfiguration(tester.element(incoming));
+      await tester.runAsync(() {
+        final frame = Completer<void>();
+        final stream = image.image.resolve(configuration);
+        late final ImageStreamListener listener;
+        listener = ImageStreamListener(
+          (_, _) {
+            stream.removeListener(listener);
+            frame.complete();
+          },
+          onError: (Object error, StackTrace? stackTrace) {
+            stream.removeListener(listener);
+            frame.completeError(error, stackTrace);
+          },
+        );
+        stream.addListener(listener);
+        return frame.future;
+      });
+    } else {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 200)));
+    }
     await tester.pump();
-    await tester.pump(fadeDuration);
     await tester.pump(fadeDuration);
     await tester.pump();
   }
@@ -128,6 +203,113 @@ void main() {
     await tester.pump();
     await finishImageTransition(tester);
     expectVisibleBackdrop(tester, third.path);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('pending local rotation keeps the settled backdrop until the file resolves', (tester) async {
+    final checks = <String, Completer<bool>>{};
+    final probes = <String, int>{};
+    Future<bool> fileExists(File file) {
+      probes.update(file.path, (count) => count + 1, ifAbsent: () => 1);
+      return (checks[file.path] ??= Completer<bool>()).future;
+    }
+
+    await tester.pumpWidget(buildAsyncBackdrop([first.path, second.path], fileExists: fileExists));
+    checks[first.path]!.complete(true);
+    await tester.pump();
+    await tester.pump();
+    await finishImageTransition(tester);
+    expectVisibleBackdrop(tester, first.path);
+
+    await tester.pump(_rotationInterval);
+    expect(checks[second.path], isNotNull);
+    expect(renderedFilePaths(tester), [first.path]);
+    expect(probes[second.path], 1);
+
+    checks[second.path]!.complete(true);
+    await tester.pump();
+    await tester.pump();
+    expect(renderedFilePaths(tester), [first.path, second.path]);
+    final incoming = tester.widget<Image>(find.byType(Image).last);
+    final resized = incoming.image as ResizeImage;
+    final (expectedWidth, expectedHeight) = MediaImageHelper.getMemCacheDimensions(
+      displayWidth: 320,
+      displayHeight: 180,
+      imageType: ImageType.art,
+    );
+    expect(resized.width, expectedWidth);
+    expect(resized.height, expectedHeight);
+    await finishImageTransition(tester);
+    expectVisibleBackdrop(tester, second.path);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('late local completion cannot replace a newer media path', (tester) async {
+    final checks = <String, Completer<bool>>{};
+    Future<bool> fileExists(File file) => (checks[file.path] ??= Completer<bool>()).future;
+
+    await tester.pumpWidget(buildAsyncBackdrop([first.path], fileExists: fileExists, mediaKey: 'movie-a'));
+    expect(find.byType(Image), findsNothing);
+
+    await tester.pumpWidget(buildAsyncBackdrop([second.path], fileExists: fileExists, mediaKey: 'movie-b'));
+    checks[second.path]!.complete(true);
+    await tester.pump();
+    await tester.pump();
+    await finishImageTransition(tester);
+    expectVisibleBackdrop(tester, second.path);
+
+    checks[first.path]!.complete(true);
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+    expect(renderedFilePaths(tester), [second.path]);
+    expectVisibleBackdrop(tester, second.path);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('confirmed missing local path advances once and stays cached', (tester) async {
+    final missing = '${directory.path}/missing.png';
+    final checks = <String, Completer<bool>>{};
+    final probes = <String, int>{};
+    Future<bool> fileExists(File file) {
+      probes.update(file.path, (count) => count + 1, ifAbsent: () => 1);
+      return (checks[file.path] ??= Completer<bool>()).future;
+    }
+
+    await tester.pumpWidget(buildAsyncBackdrop([first.path], fileExists: fileExists, mediaKey: 'settled'));
+    checks[first.path]!.complete(true);
+    await tester.pump();
+    await tester.pump();
+    await finishImageTransition(tester);
+    expectVisibleBackdrop(tester, first.path);
+
+    await tester.pumpWidget(
+      buildAsyncBackdrop([missing, second.path], fileExists: fileExists, mediaKey: 'replacement'),
+    );
+    expect(renderedFilePaths(tester), [first.path]);
+
+    checks[missing]!.complete(false);
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+    expect(checks[second.path], isNotNull);
+    expect(renderedFilePaths(tester), [first.path]);
+
+    checks[second.path]!.complete(true);
+    await tester.pump();
+    await tester.pump();
+    await finishImageTransition(tester);
+    expectVisibleBackdrop(tester, second.path);
+
+    await tester.pumpWidget(
+      buildAsyncBackdrop([missing, second.path], fileExists: fileExists, mediaKey: 'replacement'),
+    );
+    await tester.pump(_rotationInterval * 2);
+    expect(probes[missing], 1);
+    expectVisibleBackdrop(tester, second.path);
 
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -215,12 +397,16 @@ void main() {
         ),
       ),
     );
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+    await tester.pump();
+    await tester.pump();
     expect(renderedFilePaths(tester), [first.path]);
 
     await tester.pump(const Duration(seconds: 10));
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
+    await tester.pump();
+    await tester.pump();
     expect(renderedFilePaths(tester).last, second.path);
-    await finishImageTransition(tester, fadeDuration: const Duration(milliseconds: 280));
-    expectVisibleBackdrop(tester, second.path);
 
     await tester.pumpWidget(const SizedBox.shrink());
   });

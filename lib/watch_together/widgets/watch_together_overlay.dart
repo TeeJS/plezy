@@ -19,11 +19,10 @@ import '../models/watch_session.dart';
 import '../providers/watch_together_provider.dart';
 
 class WatchTogetherSessionIndicator extends StatelessWidget {
-  final VoidCallback? onLeaveSession;
   final VoidCallback? onCancelAutoHide;
   final VoidCallback? onStartAutoHide;
 
-  const WatchTogetherSessionIndicator({super.key, this.onLeaveSession, this.onCancelAutoHide, this.onStartAutoHide});
+  const WatchTogetherSessionIndicator({super.key, this.onCancelAutoHide, this.onStartAutoHide});
 
   @override
   Widget build(BuildContext context) {
@@ -45,10 +44,7 @@ class WatchTogetherSessionIndicator extends StatelessWidget {
     onCancelAutoHide?.call();
     unawaited(
       OverlaySheetController.of(context)
-          .show(
-            showDragHandle: true,
-            builder: (context) => _SessionMenuSheet(provider: provider, onLeaveSession: onLeaveSession),
-          )
+          .show(showDragHandle: true, builder: (context) => _SessionMenuSheet(provider: provider))
           .whenComplete(() => onStartAutoHide?.call()),
     );
   }
@@ -73,9 +69,16 @@ class _SessionIndicator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final semanticValue = [
+      '${t.watchTogether.participants}: $participantCount',
+      if (isHost) t.watchTogether.youAreHost,
+      if (isSyncing) t.watchTogether.syncing,
+    ].join(', ');
+
     return FocusableWrapper(
       onSelect: onTap,
       semanticLabel: t.watchTogether.openSessionControls,
+      semanticValue: semanticValue,
       descendantsAreFocusable: false,
       borderRadius: 20,
       useBackgroundFocus: true,
@@ -131,9 +134,8 @@ class _SessionIndicator extends StatelessWidget {
 
 class _SessionMenuSheet extends StatelessWidget {
   final WatchTogetherProvider provider;
-  final VoidCallback? onLeaveSession;
 
-  const _SessionMenuSheet({required this.provider, this.onLeaveSession});
+  const _SessionMenuSheet({required this.provider});
 
   @override
   Widget build(BuildContext context) {
@@ -162,6 +164,7 @@ class _SessionMenuSheet extends StatelessWidget {
         ),
         Flexible(
           child: ListView(
+            shrinkWrap: true,
             padding: const EdgeInsets.all(16),
             children: [
               Text(
@@ -173,6 +176,7 @@ class _SessionMenuSheet extends StatelessWidget {
                 FocusableWrapper(
                   onSelect: () => _copySessionCode(context, provider.sessionId!),
                   semanticLabel: t.watchTogether.copySessionCode,
+                  semanticValue: provider.sessionId!,
                   descendantsAreFocusable: false,
                   borderRadius: 8,
                   useBackgroundFocus: true,
@@ -273,8 +277,11 @@ class _SessionMenuSheet extends StatelessWidget {
     if (context.mounted) {
       OverlaySheetController.closeAdaptive(context);
     }
-    unawaited(provider.leaveSession());
-    onLeaveSession?.call();
+    unawaited(
+      provider.leaveSession().catchError((Object error, StackTrace stackTrace) {
+        appLogger.e('WatchTogether: Overlay leave failed', error: error, stackTrace: stackTrace);
+      }),
+    );
   }
 }
 

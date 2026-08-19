@@ -1,4 +1,5 @@
 import '../../database/app_database.dart';
+import '../../i18n/strings.g.dart';
 import '../../media/media_item.dart';
 import '../../media/media_server_client.dart';
 import '../../media/media_source_info.dart';
@@ -24,9 +25,6 @@ class MusicSource {
   /// `DirectPlay` / `Transcode` for progress reports.
   final String? playMethod;
 
-  final int selectedMediaIndex;
-  final String? selectedMediaSourceId;
-
   /// True when [url] points at a downloaded/local copy.
   final bool isOffline;
 
@@ -41,8 +39,6 @@ class MusicSource {
     this.headers,
     this.playSessionId,
     this.playMethod,
-    this.selectedMediaIndex = 0,
-    this.selectedMediaSourceId,
     this.isOffline = false,
     this.mediaInfo,
     this.reportingClient,
@@ -69,23 +65,28 @@ class ServerMusicSourceResolver implements MusicSourceResolver {
   Future<MusicSource> resolve(MediaItem track) async {
     final settings = await SettingsService.getInstance();
     final context = await PlaybackSourceResolver(serverManager: serverManager, database: database).resolve(
-      metadata: track,
-      selectedMediaIndex: 0,
+      PlaybackInitializationOptions(
+        metadata: track,
+        selectedMediaIndex: 0,
+        // Video-shaped preset is ignored for tracks; `original` also keeps the
+        // resolver's downloaded-copy preference on.
+        qualityPreset: TranscodeQualityPreset.original,
+        audioQualityPreset: settings.read(SettingsService.musicQualityPreset),
+        // Plex music transcode requires both session ids; fresh per track so
+        // concurrent gapless arming never reuses a live transcode session.
+        sessionIdentifier: generateSessionIdentifier(),
+        transcodeSessionId: generateSessionIdentifier(),
+      ),
       offlineLibraryMode: false,
-      // Video-shaped preset is ignored for tracks; `original` also keeps the
-      // resolver's downloaded-copy preference on.
-      qualityPreset: TranscodeQualityPreset.original,
-      audioQualityPreset: settings.read(SettingsService.musicQualityPreset),
-      // Plex music transcode requires both session ids; fresh per track so
-      // concurrent gapless arming never reuses a live transcode session.
-      sessionIdentifier: generateSessionIdentifier(),
-      transcodeSessionId: generateSessionIdentifier(),
     );
 
     final result = context.result;
     final url = result.videoUrl;
     if (url == null) {
-      throw PlaybackException('No audio URL available for ${track.title ?? track.id}');
+      throw PlaybackException(
+        t.music.noAudioUrl(track: track.title ?? track.id),
+        reason: PlaybackFailureReason.noPlayableSource,
+      );
     }
 
     return MusicSource(
@@ -93,8 +94,6 @@ class ServerMusicSourceResolver implements MusicSourceResolver {
       headers: context.streamHeaders,
       playSessionId: result.playSessionId,
       playMethod: result.playMethod ?? (result.isTranscoding ? 'Transcode' : 'DirectPlay'),
-      selectedMediaIndex: result.selectedMediaIndex,
-      selectedMediaSourceId: result.selectedMediaSourceId,
       isOffline: result.isOffline,
       mediaInfo: result.mediaInfo,
       reportingClient: context.reportingClient,

@@ -1,16 +1,6 @@
 part of '../../jellyfin_client.dart';
 
-mixin _JellyfinLiveTvMethods on MediaServerCacheMixin {
-  JellyfinConnection get connection;
-  FailoverHttpClient get _http;
-  String? _absolutizeImagePath(String? path);
-  Future<List<Map<String, dynamic>>> _safeFetchItemsArray(
-    String path,
-    Map<String, dynamic> queryParameters, {
-    // ignore: unused_element_parameter
-    _HubRetryPolicy? retry,
-  });
-
+mixin _JellyfinLiveTvMethods on _JellyfinClientInternals {
   /// Returns `true` when this server has Live TV configured (channels
   /// available). Probes `/LiveTv/Channels?limit=1`. Used by [MultiServerProvider]
   /// to gate the Live TV menu.
@@ -30,7 +20,7 @@ mixin _JellyfinLiveTvMethods on MediaServerCacheMixin {
       }
       return false;
     } catch (e) {
-      appLogger.d('Jellyfin Live TV probe failed', error: e);
+      appLogger.d('${dialect.productName} Live TV probe failed', error: e);
       return false;
     }
   }
@@ -50,8 +40,8 @@ mixin _JellyfinLiveTvMethods on MediaServerCacheMixin {
 
   /// EPG / programs grid. [channelIds] scopes to specific channels (when
   /// empty, the server returns programs across all channels). [beginsAt] /
-  /// [endsAt] are epoch seconds and bound the time window — Jellyfin uses
-  /// ISO 8601 strings on the wire.
+  /// [endsAt] are epoch seconds and bound the time window — both MediaBrowser
+  /// dialects use ISO 8601 strings on the wire.
   Future<List<LiveTvProgram>> fetchLiveTvPrograms({
     List<String> channelIds = const [],
     int? beginsAt,
@@ -140,7 +130,7 @@ mixin _JellyfinLiveTvMethods on MediaServerCacheMixin {
   LiveTvSupport get liveTv => _JellyfinLiveTvSupport(this as JellyfinClient);
 }
 
-/// Adapter from [LiveTvSupport] to Jellyfin channel/program helpers.
+/// Adapter from [LiveTvSupport] to MediaBrowser channel/program helpers.
 class _JellyfinLiveTvSupport implements LiveTvSupport {
   final JellyfinClient _client;
   _JellyfinLiveTvSupport(this._client);
@@ -160,38 +150,46 @@ class _JellyfinLiveTvSupport implements LiveTvSupport {
     return _client.fetchLiveTvPrograms(beginsAt: toEpoch(from), endsAt: toEpoch(to));
   }
 
-  @override
-  Future<LiveTvStreamResolution?> resolveStreamUrl(String channelKey, {String? dvrKey}) async {
+  /// Negotiate the HLS transcode URL + session identity for [channelKey].
+  /// Jellyfin-only: Plex live URLs are only valid after a tune, so the shared
+  /// entry point is [startPlayback].
+  Future<LiveTvStreamResolution?> _resolveStreamUrl(String channelKey) async {
     final info = await _client.getPlaybackInfo(
       channelKey,
       autoOpenLiveStream: true,
-      enableDirectPlay: true,
-      enableDirectStream: true,
-      enableTranscoding: false,
+      enableDirectPlay: false,
+      enableDirectStream: false,
+      enableTranscoding: true,
       allowVideoStreamCopy: true,
       allowAudioStreamCopy: true,
     );
-    final sources = info?['MediaSources'];
-    final source = sources is List && sources.isNotEmpty && sources.first is Map<String, dynamic>
-        ? sources.first as Map<String, dynamic>
-        : null;
-    if (source == null) return null;
+    final sources = info['MediaSources'] as List;
+    if (sources.isEmpty) return null;
+    final firstSource = sources.first;
+    if (firstSource is! Map<String, dynamic>) {
+      throw PlaybackException(
+        t.liveTv.invalidPlaybackData(product: _client.dialect.productName),
+        reason: PlaybackFailureReason.invalidPlaybackData,
+      );
+    }
+    final source = firstSource;
 
     String? nonEmptyString(dynamic raw) => raw is String && raw.isNotEmpty ? raw : null;
 
-    var playSessionId = nonEmptyString(info?['PlaySessionId']);
+    var playSessionId = nonEmptyString(info['PlaySessionId']);
     var mediaSourceId = nonEmptyString(source['Id']);
     var liveStreamId = nonEmptyString(source['LiveStreamId']);
-    final rawUrl = nonEmptyString(source['DirectStreamUrl']);
-    final url = rawUrl != null
-        ? _client._withApiKey(rawUrl)
-        : _client.buildDirectStreamUrl(
-            channelKey,
-            container: nonEmptyString(source['Container']),
-            mediaSourceId: mediaSourceId,
-            playSessionId: playSessionId,
-            liveStreamId: liveStreamId,
-          );
+    final rawUrl = nonEmptyString(source['TranscodingUrl']);
+    if (rawUrl == null) {
+      appLogger.w('${_client.dialect.productName} Live TV negotiation returned no HLS transcode URL');
+      return null;
+    }
+    final rawUri = Uri.tryParse(rawUrl);
+    if (rawUri == null || !rawUri.path.toLowerCase().endsWith('.m3u8')) {
+      appLogger.w('${_client.dialect.productName} Live TV negotiation returned no HLS transcode URL');
+      return null;
+    }
+    final url = _client._withApiKey(rawUrl);
     final query = Uri.tryParse(url)?.queryParameters;
     playSessionId ??= query?['PlaySessionId'];
     mediaSourceId ??= query?['MediaSourceId'];
@@ -201,19 +199,21 @@ class _JellyfinLiveTvSupport implements LiveTvSupport {
       playSessionId: playSessionId,
       mediaSourceId: mediaSourceId,
       liveStreamId: liveStreamId,
+      playMethod: 'Transcode',
     );
   }
 
   @override
   Future<LiveTvPlaybackSession?> startPlayback(String channelKey, {String? dvrKey}) async {
-    final resolution = await resolveStreamUrl(channelKey, dvrKey: dvrKey);
+    final resolution = await _resolveStreamUrl(channelKey);
     if (resolution == null) return null;
     return _JellyfinLiveTvPlaybackSession(_client, channelKey, resolution);
   }
 
   /// SharedPreferences key for the locally-persisted favorite-channel list.
-  /// Keyed by the compound connection id (`{machineId}/{userId}`) so two
-  /// Jellyfin users on the same server don't share favorites.
+  /// Keyed by the compound connection id (`{machineId}/{userId}`) so users on
+  /// the same MediaBrowser server don't share favorites.
+  // Keep the legacy prefix: the connection id isolates both dialects, and changing it would lose Jellyfin ordering.
   String get _favoritesPrefsKey => 'jellyfin_fav_channels:${_client.connection.id}';
 
   /// Legacy bare-machineId key, kept for one-shot migration.
@@ -228,51 +228,67 @@ class _JellyfinLiveTvSupport implements LiveTvSupport {
   @override
   FavoriteChannelPersistenceMode get favoritePersistenceMode => FavoriteChannelPersistenceMode.serverSlice;
 
+  Future<List<FavoriteChannel>> _readPersistedFavoriteChannels() =>
+      _client._favoritesRepository.read(key: _favoritesPrefsKey, legacyKey: _legacyFavoritesPrefsKey);
+
   /// Local list is the source of truth (preserves order + display fields).
   /// Server-side `IsFavorite` is mirrored on writes via [setFavoriteChannels].
   @override
-  Future<List<FavoriteChannel>> fetchFavoriteChannels() async {
-    try {
-      return await _client._favoritesRepository.read(key: _favoritesPrefsKey, legacyKey: _legacyFavoritesPrefsKey);
-    } catch (e) {
-      appLogger.e('Failed to read Jellyfin favorite channels', error: e);
-      return const [];
-    }
-  }
+  Future<List<FavoriteChannel>> fetchFavoriteChannels() => _readPersistedFavoriteChannels();
 
   @override
   Future<void> setFavoriteChannels(List<FavoriteChannel> channels) async {
-    try {
-      final previous = await fetchFavoriteChannels();
-      final previousIds = previous.map((c) => c.id).toSet();
-      final newIds = channels.map((c) => c.id).toSet();
+    final previous = await _readPersistedFavoriteChannels();
+    final previousIds = previous.map((channel) => channel.id).toSet();
+    final requestedIds = channels.map((channel) => channel.id).toSet();
+    final confirmedIds = {...previousIds};
+    Object? firstError;
+    StackTrace? firstStackTrace;
 
-      for (final id in newIds.difference(previousIds)) {
-        try {
-          await _client._setItemFavorite(id, true);
-        } catch (e) {
-          appLogger.w('Failed to mark Jellyfin channel $id favorite: $e');
+    Future<void> applyMutation(String id, bool isFavorite) async {
+      try {
+        await _client._setItemFavorite(id, isFavorite);
+        if (isFavorite) {
+          confirmedIds.add(id);
+        } else {
+          confirmedIds.remove(id);
         }
+      } catch (error, stackTrace) {
+        firstError ??= error;
+        firstStackTrace ??= stackTrace;
+        appLogger.w(
+          'Failed to update a ${_client.dialect.productName} favorite channel',
+          error: error,
+          stackTrace: stackTrace,
+        );
       }
-      for (final id in previousIds.difference(newIds)) {
-        try {
-          await _client._setItemFavorite(id, false);
-        } catch (e) {
-          appLogger.w('Failed to unmark Jellyfin channel $id favorite: $e');
-        }
-      }
+    }
 
-      await _client._favoritesRepository.write(_favoritesPrefsKey, channels);
-    } catch (e) {
-      appLogger.e('Failed to save Jellyfin favorite channels', error: e);
+    for (final id in requestedIds.difference(previousIds)) {
+      await applyMutation(id, true);
+    }
+    for (final id in previousIds.difference(requestedIds)) {
+      await applyMutation(id, false);
+    }
+
+    final confirmed = <FavoriteChannel>[
+      for (final channel in channels)
+        if (confirmedIds.contains(channel.id)) channel,
+      for (final channel in previous)
+        if (!requestedIds.contains(channel.id) && confirmedIds.contains(channel.id)) channel,
+    ];
+    await _client._favoritesRepository.write(_favoritesPrefsKey, confirmed);
+
+    if (firstError != null) {
+      Error.throwWithStackTrace(firstError!, firstStackTrace!);
     }
   }
 }
 
-/// A Jellyfin live playback session: one negotiated direct-stream URL plus
+/// A MediaBrowser live playback session: one negotiated HLS transcode URL plus
 /// `/Sessions/Playing*` heartbeats via [JellyfinLiveSessionTracker]. No
 /// program-scoped session and no time-shift — [recover] re-opens the same
-/// session-less URL.
+/// negotiated URL.
 class _JellyfinLiveTvPlaybackSession implements LiveTvPlaybackSession {
   final JellyfinClient _client;
   final String _channelKey;
@@ -285,6 +301,7 @@ class _JellyfinLiveTvPlaybackSession implements LiveTvPlaybackSession {
         playSessionId: resolution.playSessionId,
         mediaSourceId: resolution.mediaSourceId,
         liveStreamId: resolution.liveStreamId,
+        playMethod: resolution.playMethod,
       );
 
   @override
@@ -296,11 +313,19 @@ class _JellyfinLiveTvPlaybackSession implements LiveTvPlaybackSession {
   @override
   CaptureBuffer? get captureBuffer => null;
 
+  /// Intentionally unsupported: the session plays one URL negotiated at
+  /// start, so there is no rebuild through which a server-side subtitle
+  /// selection could be delivered. Jellyfin's live transcode profile decides
+  /// subtitle handling on its own.
+  @override
+  List<MediaSubtitleTrack> get subtitleTracks => const [];
+
   @override
   bool get canTimeShift => false;
 
   @override
-  Future<String?> streamUrlAt({int? offsetSeconds}) async => offsetSeconds == null ? _url : null;
+  Future<String?> streamUrlAt({int? offsetSeconds, MediaSubtitleTrack? subtitleTrack}) async =>
+      offsetSeconds == null && subtitleTrack == null ? _url : null;
 
   @override
   Future<CaptureBuffer?> reportTimeline({

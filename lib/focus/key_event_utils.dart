@@ -123,6 +123,45 @@ KeyEventResult handleOneShotSelect(KeyEvent event, VoidCallback onActivate) {
   return KeyEventResult.handled;
 }
 
+/// Whether the primary focus currently belongs to an active text editor.
+///
+/// Ancestor key handlers use this to stay off keys a focused field owns.
+/// Flutter dispatches a key event from the focused node upwards, and the
+/// editing shortcuts that turn Backspace into a deletion live in
+/// [DefaultTextEditingShortcuts] at the very top of the app — *above* any
+/// screen. An ancestor that claims Backspace as "back" therefore both steals
+/// the navigation and stops the character from ever being deleted (#1741).
+///
+/// [EditableText] builds its [Focus] internally, so the focused node's context
+/// resolves to the owning [EditableTextState].
+bool isTextEditingFocused() {
+  final context = FocusManager.instance.primaryFocus?.context;
+  if (context == null) return false;
+  return context.findAncestorStateOfType<EditableTextState>() != null;
+}
+
+/// Expands a UTF-16 [range] to whole extended grapheme clusters in [text].
+///
+/// Flutter selections use UTF-16 code-unit offsets. Custom editors must pass a
+/// non-empty range containing the code units they intend to replace; the
+/// returned range is normalized, clamped, and safe to use with
+/// [String.replaceRange] without splitting a user-perceived character.
+TextRange expandToGraphemeRange(String text, TextRange range) {
+  if (text.isEmpty) return TextRange.empty;
+
+  final first = range.start.clamp(0, text.length);
+  final second = range.end.clamp(0, text.length);
+  final start = first <= second ? first : second;
+  final end = first <= second ? second : first;
+  if (start == end) return TextRange.collapsed(start);
+
+  final boundary = CharacterBoundary(text);
+  return TextRange(
+    start: boundary.getLeadingTextBoundaryAt(start) ?? 0,
+    end: boundary.getTrailingTextBoundaryAt(end - 1) ?? text.length,
+  );
+}
+
 /// Creates a [FocusOnKeyEventCallback] that dispatches d-pad / arrow keys to
 /// the provided directional callbacks.
 ///

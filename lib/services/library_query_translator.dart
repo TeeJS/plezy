@@ -5,8 +5,13 @@ import 'plex_constants.dart';
 /// Browse responses retain up to three backdrops so hero surfaces can rotate
 /// artwork without allowing image-tag payloads to grow without bound.
 const jellyfinBackdropImageLimit = 3;
+
+/// `Thumb` is deliberately absent: `JellyfinMappers` never reads
+/// `ImageTags['Thumb']`, and `parentThumbPath`/`grandparentThumbPath` are built
+/// from the season/series *Primary* tags. Asking for it added a dead image type
+/// to ~40 requests and widened the server's inherited-image parent walk.
 const jellyfinImageQueryParameters = <String, String>{
-  'EnableImageTypes': 'Primary,Backdrop,Thumb,Logo',
+  'EnableImageTypes': 'Primary,Backdrop,Logo',
   'ImageTypeLimit': '$jellyfinBackdropImageLimit',
 };
 
@@ -52,9 +57,16 @@ class PlexLibraryQueryTranslator implements LibraryQueryTranslator {
   @override
   Map<String, String> toQueryParameters(LibraryQuery query) {
     final filters = <String, String>{};
-    final kindNumber = _plexTypeNumberFor(query.kind);
-    if (kindNumber != null) {
-      filters['type'] = kindNumber.toString();
+    if (query.includeKinds.isNotEmpty) {
+      final kindNumbers = query.includeKinds.map(_plexTypeNumberFor).whereType<int>().join(',');
+      if (kindNumbers.isNotEmpty) {
+        filters['type'] = kindNumbers;
+      }
+    } else {
+      final kindNumber = _plexTypeNumberFor(query.kind);
+      if (kindNumber != null) {
+        filters['type'] = kindNumber.toString();
+      }
     }
     final sort = query.sort;
     if (sort != null) {
@@ -221,7 +233,7 @@ class JellyfinLibraryQueryTranslator implements LibraryQueryTranslator {
       'StartIndex': query.offset.toString(),
       'Limit': query.limit.toString(),
       'EnableTotalRecordCount': 'true',
-      'IncludeItemTypes': _includeTypesFor(query.kind),
+      'IncludeItemTypes': _includeTypesFor(query),
       'Fields': fields,
       ...jellyfinImageQueryParameters,
     };
@@ -263,7 +275,14 @@ class JellyfinLibraryQueryTranslator implements LibraryQueryTranslator {
     return params;
   }
 
-  static String _includeTypesFor(MediaKind? kind) {
+  static String _includeTypesFor(LibraryQuery query) {
+    if (query.includeKinds.isNotEmpty) {
+      return query.includeKinds.map(_includeTypesForKind).join(',');
+    }
+    return _includeTypesForKind(query.kind);
+  }
+
+  static String _includeTypesForKind(MediaKind? kind) {
     return switch (kind) {
       MediaKind.movie => 'Movie',
       MediaKind.show => 'Series',

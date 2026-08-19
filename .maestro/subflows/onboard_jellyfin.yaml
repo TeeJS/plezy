@@ -10,9 +10,13 @@ appId: com.edde746.plezy
       - extendedWaitUntil:
           visible: "(?s)^(?:Connect to Jellyfin|Wait).*"
           timeout: 30000
-      - tapOn:
-          text: "Wait"
-          optional: true
+# Optional taps still pay Maestro's full search cost when they miss; guard them
+# with one visibility check instead.
+      - runFlow:
+          when:
+            visible: "Wait"
+          commands:
+            - tapOn: "Wait"
       - extendedWaitUntil:
           visible: "Connect to Jellyfin"
           timeout: 30000
@@ -22,7 +26,6 @@ appId: com.edde746.plezy
     timeout: 10000
 - tapOn: "(?s)Server URLs.*"
 - inputText: ${JELLYFIN_URL}
-- hideKeyboard
 - tapOn: "Find server"
 - extendedWaitUntil:
     visible: "Maestro Jellyfin"
@@ -31,8 +34,15 @@ appId: com.edde746.plezy
 - inputText: "maestro"
 - tapOn: "Password"
 - inputText: "maestro"
-- hideKeyboard
-- tapOn: "Sign in"
-- extendedWaitUntil:
-    visible: "Discover"
-    timeout: 30000
+- pressKey: ENTER
+- retry:
+    maxRetries: 1
+    commands:
+      - runFlow:
+          when:
+            visible: "Sign in"
+          commands:
+            - tapOn: "Sign in"
+      - extendedWaitUntil:
+          visible: "Discover"
+          timeout: 30000

@@ -1,18 +1,28 @@
 appId: com.edde746.plezy
 ---
-- runFlow: onboard_jellyfin.yaml
+- runFlow: ensure_onboarded.yaml
 - tapOn: "(?s)^Search.*"
 - extendedWaitUntil:
     visible: "Search movies, shows, music..."
     timeout: 10000
 - tapOn: "Search movies, shows, music..."
 - inputText: "${SAMPLE_TITLE}"
-- hideKeyboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - pressKey: ENTER
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+# Codec cards retain watch state and resume position between flows, so accept
+# any valid watch-state label to keep this subflow rerunnable.
 - extendedWaitUntil:
-    visible: "(?s).*${SAMPLE_TITLE}$"
+    visible: "(?s)^${SAMPLE_TITLE}, movie, (?:watched|unwatched|[0-9]+ percent watched)$"
     timeout: 15000
-- tapOn:
-    point: "50%,24%"
+- tapOn: "(?s)^${SAMPLE_TITLE}, movie, (?:watched|unwatched|[0-9]+ percent watched)$"
 - extendedWaitUntil:
     visible: "Overview"
     timeout: 15000
@@ -23,4 +33,14 @@ appId: com.edde746.plezy
 - extendedWaitUntil:
     notVisible: "Overview"
     timeout: 15000
-- pressKey: "Remote Media Play Pause"
+- extendedWaitUntil:
+    visible: "Pause"
+    timeout: 30000
+- tapOn: "Pause"
+- extendedWaitUntil:
+    visible: "Play"
+    timeout: 5000
+- extendedWaitUntil:
+    visible: "(?s)^.*Audio & Subtitles$"
+    timeout: 30000
+- tapOn: "(?s)^.*Audio & Subtitles$"

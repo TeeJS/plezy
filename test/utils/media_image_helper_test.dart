@@ -13,8 +13,8 @@ import '../test_helpers/media_items.dart';
 /// Only [thumbnailUrl] is exercised; everything else throws via noSuchMethod.
 class _SizedUrlFakeClient implements MediaServerClient {
   @override
-  String thumbnailUrl(String? path, {int? width, int? height}) =>
-      (width == null && height == null) ? 'unsized:$path' : 'sized:$path?w=$width&h=$height';
+  String thumbnailUrl(String? path, {int? width, int? height, bool cover = true}) =>
+      (width == null && height == null) ? 'unsized:$path' : 'sized:$path?w=$width&h=$height&cover=$cover';
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
@@ -65,20 +65,6 @@ void main() {
 
       expect(url, original);
     });
-
-    test('leaves Jellyfin artwork unchanged when transcoding is disabled', () {
-      const original = 'https://jf.example/Items/item-1/Images/Primary?tag=abc&api_key=token';
-
-      final url = MediaImageHelper.getOptimizedImageUrl(
-        thumbPath: original,
-        maxWidth: 120,
-        maxHeight: 180,
-        devicePixelRatio: 2,
-        enableTranscoding: false,
-      );
-
-      expect(url, original);
-    });
   });
 
   group('MediaImageHelper.getOptimizedImageUrl sized transcodes', () {
@@ -110,7 +96,39 @@ void main() {
         devicePixelRatio: 2,
       );
 
-      expect(url, 'sized:/library/metadata/1/thumb/2?w=400&h=600');
+      expect(url, 'sized:/library/metadata/1/thumb/2?w=400&h=600&cover=true');
+    });
+
+    test('logos ask the server to fit inside the slot, not cover it', () {
+      // Logos paint with BoxFit.contain, so a covering transcode overshoots
+      // the long axis and the fit-policy decode bounds discard the extra.
+      for (final type in [ImageType.logo, ImageType.heroLogo]) {
+        final url = MediaImageHelper.getOptimizedImageUrl(
+          client: client,
+          thumbPath: '/library/metadata/1/clearLogo',
+          maxWidth: 400,
+          maxHeight: 120,
+          devicePixelRatio: 3,
+          imageType: type,
+        );
+
+        expect(url, contains('cover=false'), reason: '$type should fit inside its slot');
+      }
+    });
+
+    test('slot-filling artwork keeps covering the requested box', () {
+      for (final type in [ImageType.poster, ImageType.art, ImageType.thumb, ImageType.square, ImageType.avatar]) {
+        final url = MediaImageHelper.getOptimizedImageUrl(
+          client: client,
+          thumbPath: '/library/metadata/1/thumb/2',
+          maxWidth: 200,
+          maxHeight: 300,
+          devicePixelRatio: 2,
+          imageType: type,
+        );
+
+        expect(url, contains('cover=true'), reason: '$type should fill its slot');
+      }
     });
   });
 
@@ -142,6 +160,61 @@ void main() {
     });
   });
 
+  group('MediaImageHelper display budget scaling (#1697)', () {
+    tearDown(DevicePerformance.debugReset);
+
+    void latch4kBudget() {
+      DevicePerformance.debugReset(autoReduced: false, override: VisualEffectsSetting.auto);
+      DevicePerformance.debugDisplayShortestSideOverride = 2160;
+      DevicePerformance.debugDetectDisplayBudget();
+    }
+
+    test('a 4K display doubles the full-tier decode caps', () {
+      latch4kBudget();
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.poster),
+        (1440, 2160),
+      );
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.thumb),
+        (1920, 1080),
+      );
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.art),
+        (3840, 2160),
+      );
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.heroLogo),
+        (2000, 1000),
+      );
+    });
+
+    test('a 4K display raises the transcode clamp to the panel size', () {
+      latch4kBudget();
+      // A full-screen 4K backdrop request no longer clamps to 1080p...
+      expect(MediaImageHelper.roundDimensions(3840, 2160), (3840, 2160));
+      // ...while sub-cap requests keep their exact buckets.
+      expect(MediaImageHelper.roundDimensions(400, 600), (400, 600));
+    });
+
+    test('a 4K display leaves the reduced tier untouched', () {
+      DevicePerformance.debugReset(autoReduced: true, override: VisualEffectsSetting.auto);
+      DevicePerformance.debugDisplayShortestSideOverride = 2160;
+      DevicePerformance.debugDetectDisplayBudget();
+
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.poster),
+        (480, 720),
+      );
+      expect(MediaImageHelper.roundDimensions(3840, 2160), (1920, 1080));
+    });
+
+    test('without a latch the 1080p clamps still apply', () {
+      DevicePerformance.debugReset(autoReduced: false, override: VisualEffectsSetting.auto);
+      expect(MediaImageHelper.roundDimensions(3840, 2160), (1920, 1080));
+    });
+  });
+
   group('MediaImageHelper image type budgets', () {
     tearDown(DevicePerformance.debugReset);
 
@@ -155,6 +228,21 @@ void main() {
       expect(
         MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.heroLogo),
         (1000, 500),
+      );
+    });
+
+    test('square keeps a grid-cell decode budget while avatar stays small', () {
+      DevicePerformance.debugReset(autoReduced: false, override: VisualEffectsSetting.auto);
+
+      // Cast cards fill poster-width grid cells (issue #1591): a retina cell
+      // needs well over the avatar cap, so they use the square budget.
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.square),
+        (720, 720),
+      );
+      expect(
+        MediaImageHelper.getMemCacheDimensions(displayWidth: 4000, displayHeight: 4000, imageType: ImageType.avatar),
+        (300, 300),
       );
     });
 

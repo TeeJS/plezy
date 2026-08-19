@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import com.edde746.plezy.exoplayer.supportedMpvSpdifCodecs
 import com.edde746.plezy.shared.PlayerChannelBinding
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
@@ -12,6 +13,24 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.CancellationException
+
+internal fun completeMpvPropertyResult(
+  result: MethodChannel.Result,
+  outcome: Result<Unit>,
+  successValue: Any? = null
+) {
+  val failure = outcome.exceptionOrNull()
+  when {
+    failure == null -> result.success(successValue)
+    failure is CancellationException -> completeMpvPropertyNotInitialized(result)
+    else -> result.error("SET_PROPERTY_FAILED", "MPV property write was rejected", null)
+  }
+}
+
+internal fun completeMpvPropertyNotInitialized(result: MethodChannel.Result) {
+  result.error("NOT_INITIALIZED", "Player not initialized", null)
+}
 
 /**
  * Channel plumbing for [MpvPlayerCore]. The default instance is the video
@@ -53,8 +72,8 @@ open class MpvPlayerPlugin(
   private val pendingInitResults = mutableListOf<MethodChannel.Result>()
 
   @Volatile private var isInitializing = false
-
-  // FlutterPlugin
+  private var initAttemptCounter = 0
+  private var activeInitAttempt: Int? = null
 
   override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
     applicationContext = binding.applicationContext
@@ -62,25 +81,27 @@ open class MpvPlayerPlugin(
   }
 
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-    channels.detach()
-    if (audioOnly) {
-      // The audio core is not activity-bound; engine detach is its terminal
-      // native lifecycle event (mirrors the video core's activity detach).
-      disposeCoreForTeardown()
-    }
+    // Engine detach is terminal for both video and audio plugin instances.
+    // Dispose before detaching channels so no native work can publish into a
+    // dead messenger.
+    disposeCoreForTeardown()
+    activity = null
+    activityBinding = null
     applicationContext = null
+    channels.detach()
+  }
+
+  private fun takeCoreForTeardown(): MpvPlayerCore? {
+    ++sessionGeneration
+    val core = playerCore
+    playerCore = null
+    cancelPendingInits()
+    return core
   }
 
   private fun disposeCoreForTeardown() {
-    ++sessionGeneration
-    playerCore?.dispose()
-    playerCore = null
-    // Any in-flight init callback would never fire (its scope is cancelled
-    // by dispose), so close out queued callers explicitly.
-    completePendingInits(success = false)
+    takeCoreForTeardown()?.dispose()
   }
-
-  // ActivityAware
 
   override fun onAttachedToActivity(binding: ActivityPluginBinding) {
     activity = binding.activity
@@ -106,12 +127,16 @@ open class MpvPlayerPlugin(
   }
 
   override fun onDetachedFromActivityForConfigChanges() {
+    // The video core owns views and window services from this Activity. Plezy
+    // does not retain the engine across configuration recreation, so there is
+    // no Activity-transfer contract under which that core may survive.
+    if (!audioOnly) {
+      disposeCoreForTeardown()
+    }
     activity = null
     activityBinding = null
     Log.d(tag, "Detached from activity for config changes")
   }
-
-  // EventChannel.StreamHandler
 
   override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
     channels.listen(events)
@@ -121,11 +146,9 @@ open class MpvPlayerPlugin(
     channels.cancel()
   }
 
-  // MethodChannel.MethodCallHandler
-
   override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
     when (call.method) {
-      "initialize" -> handleInitialize(result)
+      "initialize" -> handleInitialize(call, result)
       "dispose" -> handleDispose(result)
       "setProperty" -> handleSetProperty(call, result)
       "getProperty" -> handleGetProperty(call, result)
@@ -137,6 +160,7 @@ open class MpvPlayerPlugin(
       "setVideoFrameRate" -> handleSetVideoFrameRate(call, result)
       "clearVideoFrameRate" -> handleClearVideoFrameRate(result)
       "requestAudioFocus" -> handleRequestAudioFocus(result)
+      "getAudioSpdifCodecs" -> handleGetAudioSpdifCodecs(result)
       "abandonAudioFocus" -> handleAbandonAudioFocus(result)
       "openContentFd" -> handleOpenContentFd(call, result)
       "closeContentFd" -> handleCloseContentFd(call, result)
@@ -146,7 +170,21 @@ open class MpvPlayerPlugin(
     }
   }
 
-  private fun handleInitialize(result: MethodChannel.Result) {
+  /**
+   * Derives the `audio-spdif` value for the current audio route. mpv force-passthroughs
+   * every codec named there with no decode fallback, so with no context to inspect the
+   * route the conservative answer is the empty list — decode everything (#1703, #1991).
+   */
+  private fun handleGetAudioSpdifCodecs(result: MethodChannel.Result) {
+    val context: Context? = activity ?: applicationContext
+    result.success(context?.let(::supportedMpvSpdifCodecs) ?: "")
+  }
+
+  private fun handleInitialize(call: MethodCall, result: MethodChannel.Result) {
+    // Whether the session will hardware-decode; decides the initial vo chain
+    // (MpvPlayerCore.initialVideoOutput). Absent on the audio-only core and
+    // from older callers; hardware decode is the setting's default.
+    val hardwareDecoding = call.argument<Boolean>("hardwareDecoding") ?: true
     // Video cores need the Activity (surface/view hierarchy); the audio-only
     // core is built on the application context so it can outlive it.
     val coreContext: Context? = if (audioOnly) applicationContext else activity
@@ -169,16 +207,29 @@ open class MpvPlayerPlugin(
     // call's outcome instead of disposing the in-flight core. The Dart
     // side memoizes too, but this is defense in depth for any direct
     // `invoke('initialize')` that bypasses _ensureInitialized.
-    synchronized(pendingInitResults) {
+    val attempt = synchronized(pendingInitResults) {
       pendingInitResults += result
       if (isInitializing) {
-        Log.d(tag, "Init already in flight, queuing caller")
-        return
+        null
+      } else {
+        isInitializing = true
+        (++initAttemptCounter).also { activeInitAttempt = it }
       }
-      isInitializing = true
+    }
+    if (attempt == null) {
+      Log.d(tag, "Init already in flight, queuing caller")
+      return
     }
 
     runOnMain {
+      if (!isCurrentInitAttempt(attempt) ||
+        (!audioOnly && activity !== coreContext) ||
+        (audioOnly && applicationContext !== coreContext)
+      ) {
+        completePendingInits(attempt, success = false)
+        return@runOnMain
+      }
+
       val gen: Int
       val core: MpvPlayerCore
       try {
@@ -192,34 +243,64 @@ open class MpvPlayerPlugin(
         }
 
         gen = ++sessionGeneration
-        core = MpvPlayerCore(coreContext, audioOnly).apply {
+        core = MpvPlayerCore(coreContext, audioOnly, hardwareDecoding).apply {
           delegate = this@MpvPlayerPlugin
         }
         playerCore = core
       } catch (e: Exception) {
         Log.e(tag, "Failed to initialize: ${e.message}", e)
-        completePendingInits(success = false, errorMessage = e.message)
+        completePendingInits(attempt, success = false, errorMessage = e.message)
         return@runOnMain
       }
 
       core.initialize { success ->
-        val stale = gen != sessionGeneration || playerCore !== core
-        if (stale) {
-          Log.d(tag, "Stale init callback (gen=$gen, current=$sessionGeneration)")
+        val stale = gen != sessionGeneration ||
+          playerCore !== core ||
+          !isCurrentInitAttempt(attempt)
+        if (stale || !success) {
+          if (playerCore === core) playerCore = null
+          core.dispose()
+          if (stale) {
+            Log.d(tag, "Stale init callback (gen=$gen, current=$sessionGeneration)")
+          } else {
+            Log.d(tag, "Initialized: false")
+          }
         } else {
           // Start hidden - now safe because setVisible operates on the container,
           // not the SurfaceView directly (matching ExoPlayer's approach).
           // No-op on the audio-only core, which has no render layer.
           core.setVisible(false)
-          Log.d(tag, "Initialized: $success")
+          Log.d(tag, "Initialized: true")
         }
-        completePendingInits(success = !stale && success)
+        completePendingInits(attempt, success = !stale && success)
       }
     }
   }
 
-  private fun completePendingInits(success: Boolean, errorMessage: String? = null) {
+  private fun isCurrentInitAttempt(attempt: Int): Boolean = synchronized(pendingInitResults) {
+    isInitializing && activeInitAttempt == attempt
+  }
+
+  private fun cancelPendingInits() {
     val pending = synchronized(pendingInitResults) {
+      ++initAttemptCounter
+      activeInitAttempt = null
+      isInitializing = false
+      val copy = pendingInitResults.toList()
+      pendingInitResults.clear()
+      copy
+    }
+    pending.forEach { it.success(false) }
+  }
+
+  internal fun completePendingInits(
+    attempt: Int,
+    success: Boolean,
+    errorMessage: String? = null
+  ) {
+    val pending = synchronized(pendingInitResults) {
+      if (activeInitAttempt != attempt) return
+      activeInitAttempt = null
       isInitializing = false
       val copy = pendingInitResults.toList()
       pendingInitResults.clear()
@@ -236,14 +317,7 @@ open class MpvPlayerPlugin(
 
   private fun handleDispose(result: MethodChannel.Result) {
     runOnMain {
-      val core = playerCore
-      ++sessionGeneration
-      playerCore = null
-
-      // Any in-flight init callback is cancelled with the scope, so
-      // close out queued callers here instead of leaking them.
-      completePendingInits(success = false)
-
+      val core = takeCoreForTeardown()
       core?.dispose {
         Log.d(tag, "Disposed")
         result.success(null)
@@ -261,13 +335,16 @@ open class MpvPlayerPlugin(
     }
 
     val core = playerCore
-    if (core == null) {
-      result.success(null)
+    if (core?.isInitialized != true) {
+      completeMpvPropertyNotInitialized(result)
       return
     }
 
-    core.setProperty(name, value) {
-      result.success(null)
+    core.setProperty(name, value) { outcome ->
+      if (outcome.isFailure && outcome.exceptionOrNull() !is CancellationException) {
+        Log.w(tag, "MPV rejected property '$name'; keeping the previous value")
+      }
+      completeMpvPropertyResult(result, outcome)
     }
   }
 

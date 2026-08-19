@@ -1,10 +1,9 @@
-import 'package:drift/native.dart';
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_symbols_icons/symbols.dart';
-import 'package:plezy/connection/connection_registry.dart';
-import 'package:plezy/database/app_database.dart';
 import 'package:plezy/focus/focusable_action_bar.dart';
 import 'package:plezy/focus/focusable_wrapper.dart';
 import 'package:plezy/i18n/strings.g.dart';
@@ -13,13 +12,8 @@ import 'package:plezy/media/media_item.dart';
 import 'package:plezy/media/media_kind.dart';
 import 'package:plezy/models/download_models.dart';
 import 'package:plezy/profiles/active_profile_provider.dart';
-import 'package:plezy/profiles/plex_home_service.dart';
-import 'package:plezy/profiles/profile_connection_registry.dart';
-import 'package:plezy/profiles/profile_registry.dart';
 import 'package:plezy/providers/download_provider.dart';
 import 'package:plezy/providers/multi_server_provider.dart';
-import 'package:plezy/services/data_aggregation_service.dart';
-import 'package:plezy/services/multi_server_manager.dart';
 import 'package:plezy/services/music/music_playback_service.dart';
 import 'package:plezy/services/settings_service.dart';
 import 'package:plezy/theme/mono_theme.dart';
@@ -30,7 +24,10 @@ import 'package:plezy/widgets/music/mini_player.dart';
 import 'package:provider/provider.dart';
 
 import '../../test_helpers/media_items.dart';
+import '../../test_helpers/multi_server_fixtures.dart';
 import '../../test_helpers/prefs.dart';
+import '../../test_helpers/profile_stack.dart';
+import '../../test_helpers/stub_music_playback_service.dart';
 
 final _track = testMediaItem(
   id: 'track_1',
@@ -69,6 +66,8 @@ class _FakeDownloadProvider extends ChangeNotifier implements DownloadProvider {
 /// Fixed-state fake: reports a playing session with a single-track queue.
 class _FakeMusicService extends StubMusicPlaybackService {
   MediaItem? track;
+  final StreamController<Duration> _positionController = StreamController<Duration>.broadcast(sync: true);
+  Duration _position = Duration.zero;
   int previousCalls = 0;
   int toggleCalls = 0;
   int nextCalls = 0;
@@ -77,13 +76,16 @@ class _FakeMusicService extends StubMusicPlaybackService {
   _FakeMusicService({this.track});
 
   @override
-  bool get isAvailable => true;
-
-  @override
   MediaItem? get currentTrack => track;
 
   @override
   MusicPlaybackStatus get status => track == null ? MusicPlaybackStatus.idle : MusicPlaybackStatus.playing;
+
+  @override
+  Duration get position => _position;
+
+  @override
+  Stream<Duration> get positionStream => _positionController.stream;
 
   @override
   Duration? get duration => track == null ? null : const Duration(minutes: 3);
@@ -93,6 +95,17 @@ class _FakeMusicService extends StubMusicPlaybackService {
 
   @override
   int get currentIndex => track == null ? -1 : 0;
+
+  void emitPosition(Duration position) {
+    _position = position;
+    _positionController.add(position);
+  }
+
+  void advanceTo(MediaItem next) {
+    track = next;
+    _position = Duration.zero;
+    notifyListeners();
+  }
 
   @override
   Future<void> previous() async {
@@ -112,6 +125,12 @@ class _FakeMusicService extends StubMusicPlaybackService {
   @override
   Future<void> stop() async {
     stopCalls++;
+  }
+
+  @override
+  void dispose() {
+    _positionController.close();
+    super.dispose();
   }
 }
 
@@ -137,14 +156,9 @@ void main() {
     ActiveProfileProvider? activeProfileProvider,
     DownloadProvider? downloadProvider,
   }) {
-    final manager = MultiServerManager();
-    final multiServerProvider = MultiServerProvider(manager, DataAggregationService(manager));
     addTearDown(service.dispose);
     addTearDown(observer.suppress.dispose);
-    addTearDown(() {
-      multiServerProvider.dispose();
-      manager.dispose();
-    });
+    final multiServerProvider = testMultiServer().provider;
 
     return TranslationProvider(
       child: MultiProvider(
@@ -181,6 +195,71 @@ void main() {
     expect(find.text('Dawn'), findsOneWidget);
     expect(find.text('Test Artist'), findsOneWidget);
     expect(find.byType(IconButton), findsNWidgets(2)); // play/pause + next (mobile layout)
+  });
+
+  testWidgets('details control announces the current title and artist exactly once', (tester) async {
+    final semantics = tester.ensureSemantics();
+    final service = _FakeMusicService(track: _track);
+    final observer = MusicUiRouteObserver();
+
+    await tester.pumpWidget(wrap(service: service, observer: observer));
+    await tester.pumpAndSettle();
+
+    var finder = find.bySemanticsLabel('Dawn');
+    expect(finder, findsOneWidget);
+    expect(tester.getSemantics(finder).getSemanticsData().value, 'Test Artist');
+    expect(find.bySemanticsLabel('Test Artist'), findsNothing);
+
+    service.advanceTo(
+      testMediaItem(
+        id: 'track_2',
+        backend: MediaBackend.plex,
+        kind: MediaKind.track,
+        title: 'Noon',
+        grandparentId: 'artist_2',
+        grandparentTitle: 'Second Artist',
+        durationMs: 180000,
+        serverId: 'server_1',
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    finder = find.bySemanticsLabel('Noon');
+    expect(finder, findsOneWidget);
+    expect(tester.getSemantics(finder).getSemanticsData().value, 'Second Artist');
+    expect(find.bySemanticsLabel('Second Artist'), findsNothing);
+    semantics.dispose();
+  });
+
+  testWidgets('progress resets immediately when the current track changes', (tester) async {
+    final nextTrack = testMediaItem(
+      id: 'track_2',
+      backend: MediaBackend.plex,
+      kind: MediaKind.track,
+      title: 'Noon',
+      durationMs: 180000,
+      serverId: 'server_1',
+    );
+    final service = _FakeMusicService(track: _track);
+    final observer = MusicUiRouteObserver();
+
+    await tester.pumpWidget(wrap(service: service, observer: observer));
+    await tester.pumpAndSettle();
+    service.emitPosition(const Duration(minutes: 2));
+    await tester.pump();
+
+    Iterable<double?> progressWidths() => tester
+        .widgetList<FractionallySizedBox>(find.byType(FractionallySizedBox))
+        .where((box) => box.heightFactor == 1)
+        .map((box) => box.widthFactor);
+
+    expect(progressWidths(), contains(closeTo(2 / 3, 0.001)));
+
+    service.advanceTo(nextTrack);
+    await tester.pump();
+
+    expect(progressWidths(), contains(0.0));
+    expect(progressWidths(), isNot(contains(closeTo(2 / 3, 0.001))));
   });
 
   testWidgets('tapping the card edge opens the named Now Playing route', (tester) async {
@@ -245,25 +324,11 @@ void main() {
   testWidgets('keyboard long-press anchors the context menu to the focused card instead of a stale pointer', (
     tester,
   ) async {
-    final db = AppDatabase.forTesting(NativeDatabase.memory());
-    final connections = ConnectionRegistry(db);
-    final profileConnections = ProfileConnectionRegistry(db);
-    final plexHome = PlexHomeService(
-      connections: connections,
-      profileConnections: profileConnections,
-      plexHomeUserFetcher: (_) async => const [],
-    );
-    final activeProfileProvider = ActiveProfileProvider(
-      registry: ProfileRegistry(db),
-      plexHome: plexHome,
-      connections: connections,
-    );
+    final stack = await ProfileStack.create(withStorage: false);
     final downloadProvider = _FakeDownloadProvider();
     addTearDown(() async {
-      activeProfileProvider.dispose();
+      await stack.dispose();
       downloadProvider.dispose();
-      await plexHome.dispose();
-      await db.close();
     });
     final service = _FakeMusicService(track: _track);
     final observer = MusicUiRouteObserver();
@@ -272,7 +337,7 @@ void main() {
       wrap(
         service: service,
         observer: observer,
-        activeProfileProvider: activeProfileProvider,
+        activeProfileProvider: stack.active,
         downloadProvider: downloadProvider,
       ),
     );

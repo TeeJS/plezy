@@ -1,10 +1,7 @@
 import '../database/app_database.dart';
 import '../media/ids.dart';
 import '../media/media_backend.dart';
-import '../media/media_item.dart';
 import '../media/media_server_client.dart';
-import '../models/audio_quality_preset.dart';
-import '../models/transcode_quality_preset.dart';
 import 'multi_server_manager.dart';
 import 'playback_context.dart';
 import 'playback_initialization_service.dart';
@@ -15,39 +12,15 @@ class PlaybackSourceResolver {
 
   const PlaybackSourceResolver({required this.serverManager, required this.database});
 
-  /// [preferOffline] overrides the default downloaded-copy preference
-  /// (`offlineLibraryMode || qualityPreset.isOriginal`). Pass false for
-  /// flows that must stay on the server stream, e.g. a transcode restart.
-  ///
-  /// [audioQualityPreset] is the music transcode preset, consulted by the
-  /// backends only for [MediaKind.track] items ([qualityPreset] is
-  /// video-shaped and ignored for tracks).
-  Future<PlaybackContext> resolve({
-    required MediaItem metadata,
-    required int selectedMediaIndex,
-    String? selectedMediaSourceId,
-    String? preferredVersionSignature,
-    required bool offlineLibraryMode,
-    required TranscodeQualityPreset qualityPreset,
-    AudioQualityPreset? audioQualityPreset,
-    int? selectedAudioStreamId,
-    String? sessionIdentifier,
-    String? transcodeSessionId,
-    bool? preferOffline,
-  }) async {
+  /// Prefers a downloaded copy when in offline library mode or when the
+  /// requested quality preset is original (an omitted preset keeps it on).
+  Future<PlaybackContext> resolve(PlaybackInitializationOptions options, {required bool offlineLibraryMode}) async {
+    final metadata = options.metadata;
     final reportingClient = _playbackClient(serverIdOrNull(metadata.serverId), offlineLibraryMode: offlineLibraryMode);
     final service = PlaybackInitializationService(client: reportingClient, database: database);
     final result = await service.getPlaybackData(
-      metadata: metadata,
-      selectedMediaIndex: selectedMediaIndex,
-      selectedMediaSourceId: selectedMediaSourceId,
-      preferredVersionSignature: preferredVersionSignature,
-      preferOffline: preferOffline ?? (offlineLibraryMode || qualityPreset.isOriginal),
-      qualityPreset: qualityPreset,
-      audioQualityPreset: audioQualityPreset,
-      selectedAudioStreamId: selectedAudioStreamId,
-      sessionIdentifier: sessionIdentifier,
-      transcodeSessionId: transcodeSessionId,
+      options,
+      preferOffline: offlineLibraryMode || options.qualityPreset.isOriginal,
     );
 
     final sourceKind = result.usesLocalMedia
@@ -60,19 +33,16 @@ class PlaybackSourceResolver {
       client: reportingClient,
       offlineLibraryMode: offlineLibraryMode,
     );
-    final scopeId = reportingClient?.cacheServerId;
-
     return PlaybackContext(
       metadata: metadata,
       result: result,
       sourceKind: sourceKind,
       reportingMode: reportingMode,
       reportingClient: reportingClient,
-      clientScopeId: scopeId == metadata.serverId ? null : scopeId,
       streamHeaders: _streamHeaders(
         client: reportingClient,
         sourceKind: sourceKind,
-        sessionIdentifier: sessionIdentifier,
+        sessionIdentifier: options.sessionIdentifier,
       ),
     );
   }

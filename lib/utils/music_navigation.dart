@@ -1,20 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../i18n/strings.g.dart';
 import '../media/media_item.dart';
+import '../media/media_playlist.dart';
+import '../media/media_server_client.dart';
 import '../navigation/profile_navigation_scope.dart';
 import '../screens/music/album_detail_screen.dart';
 import '../screens/music/artist_detail_screen.dart';
 import '../screens/music/now_playing_screen.dart';
 import '../services/device_performance.dart';
 import '../services/music/music_playback_service.dart';
+import '../services/playlist_items_loader.dart';
 import '../theme/mono_motion.dart';
 import '../theme/mono_tokens.dart';
 import 'app_logger.dart';
 import 'platform_detector.dart';
 import 'provider_extensions.dart';
-import 'snackbar_helper.dart';
 
 /// Route name of the now-playing screen — the mini-player's route observer
 /// suppresses itself while this (or the video player) is in the stack.
@@ -31,6 +32,20 @@ NavigatorState _contentNavigatorOf(BuildContext context) {
 /// Push the artist detail screen for [artist] on the profile navigator.
 Future<void> navigateToArtist(BuildContext context, MediaItem artist) async {
   await _contentNavigatorOf(context).push(MaterialPageRoute(builder: (context) => ArtistDetailScreen(artist: artist)));
+}
+
+/// Fetch the artist [artistId] with [client], then push its detail screen on
+/// the profile navigator. Soft-fails: a failed fetch is logged and skipped,
+/// as is navigation after [context] unmounts during the fetch.
+Future<void> openArtistById(BuildContext context, MediaServerClient client, String artistId) async {
+  MediaItem? artist;
+  try {
+    artist = await client.fetchItem(artistId);
+  } catch (e) {
+    appLogger.w('Failed to fetch artist $artistId', error: e);
+  }
+  if (artist == null || !context.mounted) return;
+  await navigateToArtist(context, artist);
 }
 
 /// Push the album detail screen for [album] on the profile navigator.
@@ -90,17 +105,7 @@ void _autoOpenNowPlayingOnTv(BuildContext context) {
   });
 }
 
-/// True when a real music playback engine is bound. On the stub this shows
-/// the standard "not supported yet" notice and returns false — check it
-/// BEFORE fetching tracks so the stub never costs a server round-trip.
-bool ensureMusicPlaybackAvailable(BuildContext context) {
-  if (context.read<MusicPlaybackService>().isAvailable) return true;
-  showAppSnackBar(context, t.messages.musicNotSupported);
-  return false;
-}
-
-/// Start playback of [tracks] via the session [MusicPlaybackService],
-/// surfacing the "not supported yet" notice while the stub is bound.
+/// Start playback of [tracks] via the session [MusicPlaybackService].
 Future<void> playTracks(
   BuildContext context, {
   required List<MediaItem> tracks,
@@ -108,7 +113,6 @@ Future<void> playTracks(
   required MusicPlayContext playContext,
   bool shuffle = false,
 }) async {
-  if (!ensureMusicPlaybackAvailable(context)) return;
   await context.read<MusicPlaybackService>().playFromList(
     tracks: tracks,
     startTrack: startTrack,
@@ -118,11 +122,82 @@ Future<void> playTracks(
   if (context.mounted) _autoOpenNowPlayingOnTv(context);
 }
 
+/// Fetch a track list with [fetch], then play it — the shape every music
+/// entry point that needs a server round-trip before playback repeats:
+/// [MusicPlaybackService.beginPlayIntent] → fetch → mounted/intent re-check →
+/// [playTracks]. Guarding the round-trip with the intent keeps a slow fetch
+/// from replacing a queue the user started later.
+///
+/// [onError] reports a failed fetch and runs only while the intent is still
+/// current and [context] mounted; passing null instead lets the failure
+/// propagate to the caller's own error boundary. [onEmpty] handles a
+/// successful but empty fetch; passing null hands the empty list to
+/// [playTracks] unchanged.
+Future<void> playFetchedTracks(
+  BuildContext context, {
+  required Future<List<MediaItem>> Function() fetch,
+  required MusicPlayContext playContext,
+  void Function(Object error, StackTrace stackTrace)? onError,
+  VoidCallback? onEmpty,
+  MediaItem? startTrack,
+  bool shuffle = false,
+}) async {
+  final service = context.read<MusicPlaybackService>();
+  final intent = service.beginPlayIntent();
+  final List<MediaItem> tracks;
+  try {
+    tracks = await fetch();
+  } catch (error, stackTrace) {
+    if (!service.isPlayIntentCurrent(intent)) return;
+    if (onError == null) rethrow;
+    if (!context.mounted) return;
+    onError(error, stackTrace);
+    return;
+  }
+  if (!context.mounted || !service.isPlayIntentCurrent(intent)) return;
+  if (tracks.isEmpty && onEmpty != null) {
+    onEmpty();
+    return;
+  }
+  await playTracks(context, tracks: tracks, startTrack: startTrack, playContext: playContext, shuffle: shuffle);
+}
+
+/// Play an audio [playlist] through the music session: hand its tracks to
+/// [playFetchedTracks] under a playlist play-context. Callers that already
+/// hold the full track list pass it as [preloadedItems] to skip the server
+/// round-trip; [onError] and [onEmpty] carry each caller's own snackbar
+/// strings. Shared by the playlist detail screen and the media context menu.
+Future<void> playAudioPlaylist(
+  BuildContext context, {
+  required MediaServerClient client,
+  required MediaPlaylist playlist,
+  bool shuffle = false,
+  MediaItem? startTrack,
+  List<MediaItem>? preloadedItems,
+  void Function(Object error, StackTrace stackTrace)? onError,
+  VoidCallback? onEmpty,
+}) {
+  return playFetchedTracks(
+    context,
+    fetch: () async => preloadedItems ?? await fetchAllPlaylistItems(client, playlist.id),
+    playContext: MusicPlayContext(title: playlist.title, kind: MusicPlayContextKind.playlist),
+    onError: onError,
+    onEmpty: onEmpty,
+    startTrack: startTrack,
+    shuffle: shuffle,
+  );
+}
+
 /// Play [track] within its album queue: fetch the album's tracks and start
 /// at [track]. Falls back to single-track playback when the track has no
 /// album, isn't found in it, or the album fetch fails.
+///
+/// Hand-written rather than routed through [playFetchedTracks]: the fallback
+/// must play under the *same* intent as the album fetch, so a stale fallback
+/// can never supersede a newer request.
 Future<void> playTrackWithAlbumContext(BuildContext context, MediaItem track) async {
-  if (!ensureMusicPlaybackAvailable(context)) return;
+  final service = context.read<MusicPlaybackService>();
+  final intent = service.beginPlayIntent();
 
   final albumId = track.parentId;
   final client = context.getMediaClientForItemOrNull(track);
@@ -130,22 +205,24 @@ Future<void> playTrackWithAlbumContext(BuildContext context, MediaItem track) as
     try {
       final tracks = await client.fetchAlbumTracks(albumId);
       final startIndex = tracks.indexWhere((item) => item.id == track.id);
-      if (!context.mounted) return;
+      if (!context.mounted || !service.isPlayIntentCurrent(intent)) return;
       if (startIndex != -1) {
         await playTracks(
           context,
           tracks: tracks,
           startTrack: tracks[startIndex],
-          playContext: MusicPlayContext(id: albumId, title: track.albumTitle ?? '', kind: MusicPlayContextKind.album),
+          playContext: MusicPlayContext(title: track.albumTitle ?? '', kind: MusicPlayContextKind.album),
         );
         return;
       }
     } catch (e) {
+      if (!service.isPlayIntentCurrent(intent)) return;
       appLogger.w('Failed to fetch album context for track ${track.id}; playing single track', error: e);
       if (!context.mounted) return;
     }
   }
 
+  if (!context.mounted || !service.isPlayIntentCurrent(intent)) return;
   await playTracks(
     context,
     tracks: [track],
@@ -157,7 +234,6 @@ Future<void> playTrackWithAlbumContext(BuildContext context, MediaItem track) as
 /// Only call when the seed's server advertises
 /// `ServerCapabilities.instantMix`.
 Future<void> playInstantMix(BuildContext context, MediaItem seed) async {
-  if (!ensureMusicPlaybackAvailable(context)) return;
   await context.read<MusicPlaybackService>().playInstantMix(seed);
   if (context.mounted) _autoOpenNowPlayingOnTv(context);
 }

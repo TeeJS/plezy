@@ -32,20 +32,26 @@ extension _VideoPlayerMediaControlsMethods on VideoPlayerScreenState {
     if (!mounted || manager == null || currentPlayer == null) return;
 
     final playbackState = context.read<PlaybackStateProvider>();
-    final canNavigateEpisodes = _currentMetadata.isEpisode || playbackState.isPlaylistActive;
-    final canSeek = !widget.isLive && currentPlayer.state.seekable;
-
-    if (!mounted || currentPlayer != player || manager != _mediaControlsManager) return;
+    final hasNavigableItems = _currentMetadata.isEpisode || playbackState.isPlaylistActive;
+    final contentCanSeek = !widget.isLive && currentPlayer.state.seekable;
+    final canControlPlayback = _canControlPlayback();
+    final canNavigateMediaItems = _canNavigateMediaItems();
 
     await manager.setControlsEnabled(
-      canGoNext: canNavigateEpisodes,
-      canGoPrevious: canNavigateEpisodes,
-      canSeek: canSeek,
+      canPlayPause: canControlPlayback,
+      canGoNext: hasNavigableItems && canNavigateMediaItems,
+      canGoPrevious: hasNavigableItems && canNavigateMediaItems,
+      canSeek: contentCanSeek && canControlPlayback,
       canStop: true,
       // In-track skips work on live TV too through the capture buffer.
-      canSkip: true,
+      canSkip: canControlPlayback,
+      // Video claims the lock-screen / remote-card side slots for ±skip
+      // (#1994); the step mirrors the in-player small skip. A mid-playback
+      // seekTimeSmall change applies on the next availability sync.
+      preferSkipOverTrackButtons: true,
+      skipInterval: Duration(seconds: SettingsService.instance.read(SettingsService.seekTimeSmall)),
       // Rate changes don't apply to a live stream.
-      canSetSpeed: !widget.isLive,
+      canSetSpeed: !widget.isLive && canControlPlayback,
     );
   }
 
@@ -58,7 +64,7 @@ extension _VideoPlayerMediaControlsMethods on VideoPlayerScreenState {
   Future<void> _restoreMediaControlsAfterResume() async {
     if (!_isPlayerInitialized || !mounted) return;
 
-    unawaited(_setWakelock(player?.state.isActive ?? false));
+    unawaited(_wakelockController.setEnabled(player?.state.isActive ?? false));
 
     final manager = _mediaControlsManager;
     final currentPlayer = player;
