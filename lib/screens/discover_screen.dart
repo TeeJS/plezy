@@ -295,6 +295,22 @@ class _DiscoverScreenState extends State<DiscoverScreen>
     );
   }
 
+  /// Vertical navigation over an explicit key list. The TV expanded layout
+  /// renders the *filtered* browse hubs (empties dropped), so it must key and
+  /// navigate in that same index space — [_allHubKeys] is aligned to the
+  /// unfiltered hubs and would target unrendered rows.
+  bool _handleBrowseVerticalNavigation(List<GlobalKey<HubSectionState>?> keys, int hubIndex, bool isUp) {
+    return navigateVerticalHubRows(
+      hubCount: keys.length,
+      hubIndex: hubIndex,
+      isUp: isUp,
+      onTopBoundary: _focusTopBoundary,
+      requestFocus: (targetIndex) {
+        keys[targetIndex]?.currentState?.requestFocusFromMemory();
+      },
+    );
+  }
+
   /// Navigate focus to the sidebar
   void _navigateToSidebar() {
     MainScreenFocusScope.focusSidebarOf(context);
@@ -1123,7 +1139,17 @@ class _DiscoverScreenState extends State<DiscoverScreen>
     final sidebarBleed = MainScreenFocusScope.sideNavigationBleedOf(context);
     final fullBleedWidth = MainScreenFocusScope.fullBleedWidthOf(context);
     final appBarReserve = (size.height * 0.075).clamp(64.0 * scale, 120.0 * scale).toDouble();
-    final cwIndexOffset = _onDeck.isNotEmpty ? 1 : 0;
+
+    // Keys aligned 1:1 with browseHubs. _orderedHubKeys is indexed by the
+    // unfiltered _hubs, but browseHubs drops empty hubs, so filter the keys
+    // with the same predicate rather than indexing them by a filtered
+    // position — otherwise a hub key follows the wrong row whenever an earlier
+    // hub is empty.
+    final browseKeys = <GlobalKey<HubSectionState>?>[
+      if (_onDeck.isNotEmpty) _continueWatchingHubKey,
+      for (int h = 0; h < _hubs.length; h++)
+        if (_hubs[h].items.isNotEmpty) (h < _orderedHubKeys.length ? _orderedHubKeys[h] : null),
+    ];
 
     return Material(
       color: theme.scaffoldBackgroundColor,
@@ -1169,22 +1195,19 @@ class _DiscoverScreenState extends State<DiscoverScreen>
                         builder: (context) {
                           final hub = browseHubs[i];
                           final isCw = hub.id == 'continue_watching';
-                          final hubKey = isCw
-                              ? _continueWatchingHubKey
-                              : (i - cwIndexOffset < _orderedHubKeys.length
-                                    ? _orderedHubKeys[i - cwIndexOffset]
-                                    : null);
+                          final hubKey = i < browseKeys.length ? browseKeys[i] : null;
                           return HubSection(
                             key: hubKey,
                             hub: hub,
-                            icon: isCw ? Symbols.play_circle_rounded : _getHubIcon(hub.title),
+                            focusMemory: _hubFocusMemory,
+                            icon: isCw ? Symbols.play_circle_rounded : hubIconFor(hub),
                             isInContinueWatching: isCw,
                             showServerName: !isCw && (showServerNameOnHubs || hubsSpanMultipleServers),
                             onRefresh: _discover.updateItem,
                             onRemoveFromContinueWatching: isCw ? _discover.refreshContinueWatching : null,
                             loadMoreItems: isCw ? _discover.loadAllContinueWatching : null,
                             onFocusedItemChanged: _setSpotlightItem,
-                            onVerticalNavigation: (isUp) => _handleVerticalNavigation(i, isUp),
+                            onVerticalNavigation: (isUp) => _handleBrowseVerticalNavigation(browseKeys, i, isUp),
                             onNavigateUp: i == 0 ? _focusTopActions : null,
                             onNavigateToSidebar: _navigateToSidebar,
                           );

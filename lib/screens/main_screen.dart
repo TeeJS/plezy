@@ -818,19 +818,21 @@ class _MainScreenState extends State<MainScreen>
     }
 
     // Track Plex.tv account presence to gate the Watchlist tab. Drift's
-    // watch() emits the current value immediately on subscription.
-    if (_connectionsSub == null && !_isOffline) {
-      _connectionsSub = context.read<ConnectionRegistry>().watchConnections().listen((connections) {
-        final hasPlexAccount = connections.whereType<PlexAccountConnection>().any((c) => c.accountToken.isNotEmpty);
-        if (hasPlexAccount != _hasPlexAccount && mounted) {
-          setState(() {
-            _hasPlexAccount = hasPlexAccount;
-            _screens = _buildScreens(_isOffline);
-            _currentTab = _normalizeTabForMode(_currentTab, _isOffline);
-          });
-        }
-      });
-    }
+    // watch() emits the current value immediately on subscription. Not gated on
+    // online state: didChangeDependencies doesn't re-run on the offline→online
+    // transition, so an offline launch would otherwise never subscribe and the
+    // Watchlist tab would stay missing until an app restart. The tab remains
+    // hidden while offline via getVisibleTabs' onlineOnly filter regardless.
+    _connectionsSub ??= context.read<ConnectionRegistry>().watchConnections().listen((connections) {
+      final hasPlexAccount = connections.whereType<PlexAccountConnection>().any((c) => c.accountToken.isNotEmpty);
+      if (hasPlexAccount != _hasPlexAccount && mounted) {
+        setState(() {
+          _hasPlexAccount = hasPlexAccount;
+          _screens = _buildScreens(_isOffline);
+          _currentTab = _normalizeTabForMode(_currentTab, _isOffline);
+        });
+      }
+    });
 
     // Listen for catalog sources (Explore tab) appearing/disappearing when a
     // provider like Trakt is connected or disconnected mid-session.
@@ -1060,6 +1062,7 @@ class _MainScreenState extends State<MainScreen>
     isOffline: isOffline,
     hasLiveTv: _hasLiveTv,
     hasExplore: _lastHasExplore,
+    hasPlexAccount: _hasPlexAccount,
     preferredStartup: SettingsService.instanceOrNull?.read(SettingsService.startupSection),
   );
 

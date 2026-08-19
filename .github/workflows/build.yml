@@ -73,7 +73,7 @@ jobs:
     permissions:
       id-token: write
       attestations: write
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -159,34 +159,26 @@ jobs:
             plezy-android-armeabi-v7a.tar.gz
             plezy-android-x86_64.tar.gz
 
-      # Fork-only: publish the raw APKs to a rolling "android-latest" release so
-      # the README download links always serve the newest build. Runs only on
-      # this fork's main branch so feature-branch builds don't clobber the files,
-      # and only when publish_rolling is on (see the input's comment).
+      # Stage the raw APKs (renamed) as an artifact so the separate,
+      # write-scoped publish-android-latest job can release them. Kept out of
+      # this build job so the repo-write token is never present while running
+      # third-party build/Gradle code — mirrors the Windows package/publish
+      # split. Unconditional upload; the publish job carries the fork/branch/
+      # publish_rolling gate.
       - name: Stage raw APKs for release
-        if: ${{ inputs.publish_rolling && github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main' }}
         run: |
           cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk plezy-android-arm64-v8a.apk
           cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk plezy-android-armeabi-v7a.apk
           cp build/app/outputs/flutter-apk/app-x86_64-release.apk plezy-android-x86_64.apk
 
-      - name: Publish APKs to android-latest release
-        if: ${{ inputs.publish_rolling && github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main' }}
-        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+      - name: Upload raw APKs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          tag_name: android-latest
-          name: Android APKs (latest)
-          body: |
-            Rolling release of the latest Android APKs built from this fork.
-            Updated automatically by CI on each build of `main`.
-          draft: false
-          prerelease: false
-          files: |
+          name: android-apk-raw
+          path: |
             plezy-android-arm64-v8a.apk
             plezy-android-armeabi-v7a.apk
             plezy-android-x86_64.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-ios:
     needs: validate-trusted-ref
@@ -910,6 +902,41 @@ jobs:
             plezy-linux-${{ matrix.arch }}.deb
             plezy-linux-${{ matrix.arch }}.rpm
             plezy-linux-${{ matrix.arch }}.pkg.tar.zst
+
+  # Fork-only: publish the raw APKs to a rolling "android-latest" release so
+  # the README download links always serve the newest build. Split out of
+  # build-android so the repo-write token is isolated to this artifact-only
+  # job — the build job runs third-party Gradle/build code with contents:read.
+  # Runs only on this fork's main branch so feature-branch builds don't clobber
+  # the files, and only when publish_rolling is on (see the input's comment).
+  publish-android-latest:
+    needs: [build-android]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.publish_rolling && github.repository == 'TeeJS/plezy' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download raw APK artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: android-apk-raw
+          path: artifacts/android-apk-raw
+      - name: Publish APKs to android-latest release
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+        with:
+          tag_name: android-latest
+          name: Android APKs (latest)
+          body: |
+            Rolling release of the latest Android APKs built from this fork.
+            Updated automatically by CI on each build of `main`.
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/android-apk-raw/plezy-android-arm64-v8a.apk
+            artifacts/android-apk-raw/plezy-android-armeabi-v7a.apk
+            artifacts/android-apk-raw/plezy-android-x86_64.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Fork-only: publish the Windows binaries to a rolling "windows-latest"
   # release so the README download links always serve the newest build. Runs

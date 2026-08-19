@@ -298,6 +298,11 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
 
   bool get _showDownloads => !PlatformDetector.isAppleTV();
 
+  /// Watchlist is a Plex-account feature and online-only. Gate on both so the
+  /// rail can't render a tab that `getVisibleTabs` excludes while offline —
+  /// tapping such a tab resolves to index -1 and desyncs the selection.
+  bool get _showWatchlist => widget.hasWatchlist && !widget.isOfflineMode;
+
   /// macOS has the system green button; mobile/TV have no OS fullscreen toggle.
   bool get _showFullscreenToggle => Platform.isWindows || Platform.isLinux;
 
@@ -427,7 +432,7 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
       case NavigationTabId.downloads:
         return _showDownloads ? _kDownloads : null;
       case NavigationTabId.watchlist:
-        return widget.hasWatchlist ? _kWatchlist : null;
+        return _showWatchlist ? _kWatchlist : null;
       case NavigationTabId.settings:
         return _kSettings;
       case NavigationTabId.liveTv:
@@ -472,7 +477,7 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
       if (hasExplore) _kExplore,
       _kSearch,
       if (_showDownloads) _kDownloads,
-      if (widget.hasWatchlist) _kWatchlist,
+      if (_showWatchlist) _kWatchlist,
       _kSettings,
       _kReconnect,
       if (hasHiddenLibraries) _kHiddenLibraries,
@@ -565,7 +570,7 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
         _kSearch,
       ],
       if (_showDownloads) _kDownloads,
-      if (widget.hasWatchlist) _kWatchlist,
+      if (_showWatchlist) _kWatchlist,
       _kSettings,
       if (_showFullscreenToggle) _kFullscreen,
     ];
@@ -841,7 +846,7 @@ class SideNavigationRailState extends State<SideNavigationRail> with MountedSetS
                                     ),
                                     const SizedBox(height: 8),
                                   ],
-                                  if (widget.hasWatchlist) ...[
+                                  if (_showWatchlist) ...[
                                     _buildNavItem(
                                       icon: Symbols.bookmark_rounded,
                                       selectedIcon: Symbols.bookmark_rounded,

@@ -44,6 +44,12 @@ class WatchlistScreenState extends State<WatchlistScreen> with FocusableTab, Ref
   bool _loading = true;
   String? _error;
 
+  /// Bumped on every [_load]. A load captures its value and only commits its
+  /// result if still current, so an earlier load aborted mid-flight (its
+  /// in-flight request cancelled by a newer load disposing the service) can't
+  /// flip the screen to an error state over a newer load's success.
+  int _loadGeneration = 0;
+
   final FocusNode _firstItemFocusNode = FocusNode(debugLabel: 'watchlist_first_item');
   StreamSubscription<WatchlistEvent>? _watchlistSub;
 
@@ -76,6 +82,7 @@ class WatchlistScreenState extends State<WatchlistScreen> with FocusableTab, Ref
   }
 
   Future<void> _load({bool silent = false}) async {
+    final generation = ++_loadGeneration;
     setState(() {
       if (!silent) _loading = true;
       _error = null;
@@ -84,7 +91,7 @@ class WatchlistScreenState extends State<WatchlistScreen> with FocusableTab, Ref
       final accounts = await context.read<ConnectionRegistry>().listPlexAccounts();
       final account = accounts.firstWhereOrNull((a) => a.accountToken.isNotEmpty);
       if (account == null) {
-        if (!mounted) return;
+        if (!mounted || generation != _loadGeneration) return;
         setState(() {
           _items = const [];
           _loading = false;
@@ -100,14 +107,14 @@ class WatchlistScreenState extends State<WatchlistScreen> with FocusableTab, Ref
       _service = service;
 
       final items = await service.getWatchlist();
-      if (!mounted) return;
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _items = items;
         _loading = false;
       });
     } catch (e, st) {
       appLogger.e('WatchlistScreen: failed to load watchlist', error: e, stackTrace: st);
-      if (!mounted) return;
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -250,14 +257,21 @@ class WatchlistScreenState extends State<WatchlistScreen> with FocusableTab, Ref
       builder: (context, density, _) {
         return LayoutBuilder(
           builder: (context, constraints) {
-            final maxExtent = GridSizeCalculator.getMaxCrossAxisExtent(context, density);
             final availableWidth = constraints.maxWidth - effectivePadding.left - effectivePadding.right;
-            final columnCount = GridSizeCalculator.getColumnCount(availableWidth, maxExtent);
+            // MediaGridGeometry is the single source for both the delegate and
+            // the column count, so the rendered grid and the isFirstColumn
+            // d-pad math below can't disagree.
+            final geometry = MediaGridGeometry.resolve(
+              context: context,
+              crossAxisExtent: availableWidth,
+              density: density,
+            );
+            final columnCount = geometry.columnCount;
 
             return GridView.builder(
               padding: effectivePadding,
               clipBehavior: Clip.none,
-              gridDelegate: MediaGridDelegate.createDelegate(context: context, density: density),
+              gridDelegate: geometry.delegate,
               itemCount: _items.length,
               itemBuilder: (context, index) {
                 final item = _items[index];
