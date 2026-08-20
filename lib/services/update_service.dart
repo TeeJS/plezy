@@ -15,8 +15,13 @@ import 'base_shared_preferences_service.dart';
 /// via auto_updater for native update dialogs and in-app installs.
 /// On all other platforms: falls back to GitHub API check + browser link dialog.
 class UpdateService {
-  static const String _githubRepo = 'edde746/plezy';
-  static const String _feedUrl = 'https://cdn.jsdelivr.net/gh/edde746/plezy@appcast/appcast.xml';
+  static const String _githubRepo = 'TeeJS/plezy';
+  // Fork appcast for the native (Sparkle/WinSparkle) path. The `appcast` branch
+  // does not exist on the fork yet, so installed Windows/macOS background checks
+  // no-op silently until it's published; the GitHub-API notify path below serves
+  // every other install in the meantime. Points at the fork — never upstream —
+  // so a fork build can't auto-update itself onto an upstream release.
+  static const String _feedUrl = 'https://cdn.jsdelivr.net/gh/TeeJS/plezy@appcast/appcast.xml';
 
   static const String _keySkippedVersion = 'update_skipped_version';
   static const String _keyLastCheckTime = 'update_last_check_time';
